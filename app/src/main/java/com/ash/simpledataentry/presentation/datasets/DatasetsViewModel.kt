@@ -26,6 +26,7 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.launch
 import androidx.work.WorkInfo
 import javax.inject.Inject
+import androidx.lifecycle.asFlow
 
 sealed class DatasetsState {
     data object Loading : DatasetsState()
@@ -88,17 +89,69 @@ class DatasetsViewModel @Inject constructor(
     fun syncDatasets() {
         val currentState = _uiState.value
         if (currentState is DatasetsState.Success && !currentState.isSyncing) {
-            Log.d("DatasetsViewModel", "=== DATASETS SYNC: Triggering WorkManager sync ===")
             _uiState.value = currentState.copy(isSyncing = true, syncProgress = 0, syncStep = "Starting sync...")
-
-            // Use WorkManager for background-safe sync and observe progress
             val workName = backgroundSyncManager.triggerImmediateSync()
+            Log.d("DatasetsViewModel", "=== DATASETS SYNC: WorkManager sync triggered with work name: $workName ===")
 
             viewModelScope.launch {
-                // Set a success message for immediate UI feedback
-                // The actual sync completion will be handled by WorkManager
-                kotlinx.coroutines.delay(2000) // Brief delay to show sync started
-                loadDatasets() // Reload after sync is triggered
+                backgroundSyncManager.getImmediateSyncWorkInfo(workName).asFlow().collect { workInfos ->
+                    val workInfo = workInfos.firstOrNull() ?: return@collect
+                    val progressData = workInfo.progress
+                    val currentStep = progressData.getString("step") ?: "Syncing..."
+                    val progress = progressData.getInt("progress", 0)
+
+                    when (workInfo.state) {
+                        WorkInfo.State.RUNNING -> {
+                            Log.d("DatasetsViewModel", "Sync Progress: $progress%, Step: $currentStep")
+                            val state = _uiState.value
+                            if (state is DatasetsState.Success) {
+                                _uiState.value = state.copy(
+                                    isSyncing = true,
+                                    syncProgress = progress,
+                                    syncStep = currentStep
+                                )
+                            }
+                        }
+                        WorkInfo.State.SUCCEEDED -> {
+                            Log.d("DatasetsViewModel", "Sync SUCCEEDED")
+                            val state = _uiState.value
+                            if (state is DatasetsState.Success) {
+                                _uiState.value = state.copy(
+                                    isSyncing = false,
+                                    syncMessage = "Sync completed successfully!",
+                                    syncProgress = 100,
+                                    syncStep = "Done"
+                                )
+                            }
+                            loadDatasets() // Refresh data after successful sync
+                        }
+                        WorkInfo.State.FAILED -> {
+                            val errorMessage = workInfo.outputData.getString("error") ?: "Sync failed"
+                            Log.e("DatasetsViewModel", "Sync FAILED: $errorMessage")
+                            val state = _uiState.value
+                            if (state is DatasetsState.Success) {
+                                _uiState.value = state.copy(
+                                    isSyncing = false,
+                                    syncMessage = "Error: $errorMessage"
+                                )
+                            }
+                        }
+                        WorkInfo.State.CANCELLED -> {
+                            Log.w("DatasetsViewModel", "Sync CANCELLED")
+                            val state = _uiState.value
+                            if (state is DatasetsState.Success) {
+                                _uiState.value = state.copy(
+                                    isSyncing = false,
+                                    syncMessage = "Sync was cancelled"
+                                )
+                            }
+                        }
+                        else -> {
+                            // ENQUEUED, BLOCKED
+                            Log.d("DatasetsViewModel", "Sync status: ${workInfo.state}")
+                        }
+                    }
+                }
             }
         } else {
             Log.w("DatasetsViewModel", "DATASETS SYNC: Cannot sync - already syncing or state is not Success")
