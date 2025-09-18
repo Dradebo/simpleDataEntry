@@ -1,11 +1,7 @@
 package com.ash.simpledataentry.presentation.dataEntry
 
 import android.app.Application
-import android.os.Build
 import android.util.Log
-import androidx.annotation.RequiresApi
-import androidx.compose.foundation.layout.size
-import androidx.compose.runtime.mutableStateMapOf
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.ash.simpledataentry.data.local.DataValueDraftDao
@@ -15,6 +11,8 @@ import com.ash.simpledataentry.domain.model.*
 import com.ash.simpledataentry.domain.repository.DataEntryRepository
 import com.ash.simpledataentry.domain.useCase.DataEntryUseCases
 import com.ash.simpledataentry.util.NetworkUtils
+import com.ash.simpledataentry.data.sync.SyncQueueManager
+import com.ash.simpledataentry.data.sync.SyncState
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -24,7 +22,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import javax.inject.Inject
 
-data class DataEntryState(
+data class DataEntryUiState(
     val datasetId: String = "",
     val datasetName: String = "",
     val period: String = "",
@@ -54,10 +52,14 @@ data class DataEntryState(
     val totalSections: Int = 0,
     val dataElementGroupedSections: Map<String, Map<String, List<DataValue>>> = emptyMap(),
     val localDraftCount: Int = 0,
-    val isSyncing: Boolean = false,
     val successMessage: String? = null,
     val isValidating: Boolean = false,
     val validationSummary: ValidationSummary? = null
+)
+
+data class CombinedDataEntryState(
+    val uiState: DataEntryUiState,
+    val syncState: SyncState
 )
 
 @HiltViewModel
@@ -67,15 +69,21 @@ class DataEntryViewModel @Inject constructor(
     private val useCases: DataEntryUseCases,
     private val draftDao: DataValueDraftDao,
     private val validationRepository: ValidationRepository,
-    private val syncQueueManager: com.ash.simpledataentry.data.sync.SyncQueueManager
+    private val syncQueueManager: SyncQueueManager
 ) : ViewModel() {
-    private val _state = MutableStateFlow(DataEntryState())
-    val state: StateFlow<DataEntryState> = _state.asStateFlow()
+    private val _uiState = MutableStateFlow(DataEntryUiState())
 
-    // Track unsaved edits: key = Pair<dataElement, categoryOptionCombo>, value = DataValue
+    val combinedState: StateFlow<CombinedDataEntryState> = _uiState
+        .combine(syncQueueManager.syncState) { ui, sync ->
+            CombinedDataEntryState(ui, sync)
+        }.stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = CombinedDataEntryState(DataEntryUiState(), SyncState())
+        )
+
     private val dirtyDataValues = mutableMapOf<Pair<String, String>, DataValue>()
 
-    // --- BEGIN: Per-field TextFieldValue state ---
     private val _fieldStates = mutableStateMapOf<String, androidx.compose.ui.text.input.TextFieldValue>()
     val fieldStates: Map<String, androidx.compose.ui.text.input.TextFieldValue> get() = _fieldStates
     private fun fieldKey(dataElement: String, categoryOptionCombo: String): String = "$dataElement|$categoryOptionCombo"
@@ -90,7 +98,6 @@ class DataEntryViewModel @Inject constructor(
         _fieldStates[key] = newValue
         updateCurrentValue(newValue.text, dataValue.dataElement, dataValue.categoryOptionCombo)
     }
-    // --- END: Per-field TextFieldValue state ---
 
     private var savePressed = false
 
@@ -104,7 +111,7 @@ class DataEntryViewModel @Inject constructor(
     ) {
         viewModelScope.launch {
             try {
-                _state.update { currentState ->
+                _uiState.update { currentState ->
                     currentState.copy(
                         isLoading = true,
                         error = null,
@@ -168,38 +175,33 @@ class DataEntryViewModel @Inject constructor(
                     }
 
                     dirtyDataValues.clear()
-                    savePressed = false // Reset save state when loading new data
+                    savePressed = false
                     draftMap.forEach { (key, draft) ->
                         mergedValues.find { it.dataElement == key.first && it.categoryOptionCombo == key.second }?.let { merged ->
                             dirtyDataValues[key] = merged
                         }
                     }
 
-                    _state.update { currentState ->
+                    _uiState.update { currentState ->
 
-                        val groupedBySection = mergedValues.groupBy { it.sectionName } // Group once
+                        val groupedBySection = mergedValues.groupBy { it.sectionName }
                         val dataElementGroupedSections = groupedBySection.mapValues { (_, sectionValues) ->
                             sectionValues.groupBy { it.dataElement }
                         }
                         val totalSections = groupedBySection.size
 
-                        // Determine the initial currentSectionIndex
                         val initialOrPreservedIndex = if (totalSections > 0) {
-                            // If you want to ALWAYS open the first section on load, uncomment next line:
-                            // 0
-                            // If you want to respect a previously opened section or default to closed:
                             if (currentState.currentSectionIndex >= 0 && currentState.currentSectionIndex < totalSections) {
-                                currentState.currentSectionIndex // Preserve if valid
-                            } else if (currentState.currentSectionIndex == -1 && currentState.dataValues.isEmpty()) { // First ever load and state is still default
-                                0 // Open first section on very first load
+                                currentState.currentSectionIndex
+                            } else if (currentState.currentSectionIndex == -1 && currentState.dataValues.isEmpty()) {
+                                0
                             }
                             else {
-                                currentState.currentSectionIndex // Keep as -1 or whatever it was if sections changed
+                                currentState.currentSectionIndex
                             }
                         } else {
-                            -1 // No sections, so no section can be open
+                            -1
                         }.let {
-                            // Final check to ensure index is valid or -1
                             if (it >= totalSections && totalSections > 0) totalSections -1
                             else if (it < -1) -1
                             else it
@@ -222,12 +224,11 @@ class DataEntryViewModel @Inject constructor(
                     }
                 }
                 
-                // Load draft count after data is loaded
                 loadDraftCount()
                 
             } catch (e: Exception) {
                 Log.e("DataEntryViewModel", "Failed to load data values", e)
-                _state.update { currentState ->
+                _uiState.update { currentState ->
                     currentState.copy(
                         error = "Failed to load data values: ${e.message}",
                         isLoading = false
@@ -239,18 +240,17 @@ class DataEntryViewModel @Inject constructor(
 
     fun updateCurrentValue(value: String, dataElementUid: String, categoryOptionComboUid: String) {
         val key = dataElementUid to categoryOptionComboUid
-        val dataValueToUpdate = _state.value.dataValues.find {
+        val dataValueToUpdate = _uiState.value.dataValues.find {
             it.dataElement == dataElementUid && it.categoryOptionCombo == categoryOptionComboUid
         }
         if (dataValueToUpdate != null) {
             val updatedValueObject = dataValueToUpdate.copy(value = value)
             dirtyDataValues[key] = updatedValueObject
             
-            // Reset savePressed when new changes are made after a save
             if (savePressed) {
                 savePressed = false
             }
-            _state.update { currentState ->
+            _uiState.update { currentState ->
                 currentState.copy(
                     dataValues = currentState.dataValues.map {
                         if (it.dataElement == dataElementUid && it.categoryOptionCombo == categoryOptionComboUid) updatedValueObject else it
@@ -262,10 +262,10 @@ class DataEntryViewModel @Inject constructor(
                 if (value.isNotBlank()) {
                     draftDao.upsertDraft(
                         DataValueDraftEntity(
-                            datasetId = _state.value.datasetId,
-                            period = _state.value.period,
-                            orgUnit = _state.value.orgUnit,
-                            attributeOptionCombo = _state.value.attributeOptionCombo,
+                            datasetId = _uiState.value.datasetId,
+                            period = _uiState.value.period,
+                            orgUnit = _uiState.value.orgUnit,
+                            attributeOptionCombo = _uiState.value.attributeOptionCombo,
                             dataElement = dataElementUid,
                             categoryOptionCombo = categoryOptionComboUid,
                             value = value,
@@ -275,16 +275,15 @@ class DataEntryViewModel @Inject constructor(
                     )
                 } else {
                     draftDao.deleteDraft(
-                        datasetId = _state.value.datasetId,
-                        period = _state.value.period,
-                        orgUnit = _state.value.orgUnit,
-                        attributeOptionCombo = _state.value.attributeOptionCombo,
+                        datasetId = _uiState.value.datasetId,
+                        period = _uiState.value.period,
+                        orgUnit = _uiState.value.orgUnit,
+                        attributeOptionCombo = _uiState.value.attributeOptionCombo,
                         dataElement = dataElementUid,
                         categoryOptionCombo = categoryOptionComboUid
                     )
                 }
                 
-                // Update draft count after draft operation
                 loadDraftCount()
             }
         }
@@ -292,9 +291,9 @@ class DataEntryViewModel @Inject constructor(
 
     fun saveAllDataValues(context: android.content.Context? = null) {
         viewModelScope.launch {
-            _state.update { it.copy(saveInProgress = true, saveResult = null) }
+            _uiState.update { it.copy(saveInProgress = true, saveResult = null) }
             savePressed = true
-            val stateSnapshot = _state.value
+            val stateSnapshot = _uiState.value
 
             try {
                 val draftsToSave = dirtyDataValues.values.map { dataValue ->
@@ -317,13 +316,13 @@ class DataEntryViewModel @Inject constructor(
 
                 dirtyDataValues.clear()
 
-                _state.update { it.copy(
+                _uiState.update { it.copy(
                     saveInProgress = false,
                     saveResult = Result.success(Unit)
                 ) }
 
             } catch (e: Exception) {
-                _state.update { it.copy(
+                _uiState.update { it.copy(
                     saveInProgress = false,
                     saveResult = Result.failure(e)
                 ) }
@@ -333,19 +332,17 @@ class DataEntryViewModel @Inject constructor(
 
     fun syncData() {
         viewModelScope.launch {
-            val stateSnapshot = _state.value
+            val stateSnapshot = _uiState.value
             if (stateSnapshot.datasetId.isEmpty()) {
                 Log.e("DataEntryViewModel", "Cannot sync: datasetId is empty")
-                _state.update { it.copy(error = "Cannot sync, dataset information is missing.") }
+                _uiState.update { it.copy(error = "Cannot sync, dataset information is missing.") }
                 return@launch
             }
 
             if (!NetworkUtils.isNetworkAvailable(application)) {
-                _state.update { it.copy(error = "No network connection. Please connect and try again.") }
+                _uiState.update { it.copy(error = "No network connection. Please connect and try again.") }
                 return@launch
             }
-
-            _state.update { it.copy(isSyncing = true, error = null, successMessage = null) }
 
             val result = syncQueueManager.startSyncForInstance(
                 datasetId = stateSnapshot.datasetId,
@@ -357,8 +354,7 @@ class DataEntryViewModel @Inject constructor(
 
             if (result.isSuccess) {
                 Log.d("DataEntryViewModel", "Sync for instance completed successfully.")
-                _state.update { it.copy(isSyncing = false, successMessage = "Data synced successfully!") }
-                // Reload data to reflect synced state
+                _uiState.update { it.copy(successMessage = "Data synced successfully!") }
                 loadDataValues(
                     datasetId = stateSnapshot.datasetId,
                     datasetName = stateSnapshot.datasetName,
@@ -370,7 +366,7 @@ class DataEntryViewModel @Inject constructor(
             } else {
                 val errorMessage = result.exceptionOrNull()?.message ?: "Unknown error during sync."
                 Log.e("DataEntryViewModel", "Sync for instance failed: $errorMessage")
-                _state.update { it.copy(isSyncing = false, error = "Sync failed: $errorMessage") }
+                _uiState.update { it.copy(error = "Sync failed: $errorMessage") }
             }
         }
     }
@@ -378,7 +374,7 @@ class DataEntryViewModel @Inject constructor(
     private fun loadDraftCount() {
         viewModelScope.launch {
             try {
-                val stateSnapshot = _state.value
+                val stateSnapshot = _uiState.value
                 val draftCount = withContext(Dispatchers.IO) {
                     draftDao.getDraftCountForInstance(
                         stateSnapshot.datasetId,
@@ -387,7 +383,7 @@ class DataEntryViewModel @Inject constructor(
                         stateSnapshot.attributeOptionCombo
                     )
                 }
-                _state.update { it.copy(localDraftCount = draftCount) }
+                _uiState.update { it.copy(localDraftCount = draftCount) }
             } catch (e: Exception) {
                 Log.e("DataEntryViewModel", "Failed to load draft count", e)
             }
@@ -395,12 +391,12 @@ class DataEntryViewModel @Inject constructor(
     }
 
     fun clearMessages() {
-        _state.update { it.copy(error = null, successMessage = null) }
+        _uiState.update { it.copy(error = null, successMessage = null) }
     }
 
 
     fun toggleSection(sectionName: String) {
-        _state.update { currentState ->
+        _uiState.update { currentState ->
             val current = currentState.isExpandedSections[sectionName] ?: false
             currentState.copy(
                 isExpandedSections = currentState.isExpandedSections.toMutableMap().apply {
@@ -411,14 +407,14 @@ class DataEntryViewModel @Inject constructor(
     }
 
     fun setCurrentSectionIndex(index: Int) {
-        _state.update { currentState ->
-            if (index < 0 || index >= currentState.totalSections) { // Safety check
+        _uiState.update { currentState ->
+            if (index < 0 || index >= currentState.totalSections) {
                 return@update currentState
             }
             val newIndex = if (currentState.currentSectionIndex == index) {
-                -1 // If clicking the currently open section, close it
+                -1
             } else {
-                index // Otherwise, open the clicked section
+                index
             }
             currentState.copy(currentSectionIndex = newIndex)
         }
@@ -426,11 +422,11 @@ class DataEntryViewModel @Inject constructor(
 
 
     fun goToNextSection() {
-        _state.update { currentState ->
+        _uiState.update { currentState ->
             if (currentState.totalSections == 0) return@update currentState
 
             val newIndex = if (currentState.currentSectionIndex == -1) {
-                0 // If nothing is open, "Next" opens the first section
+                0
             } else {
                 (currentState.currentSectionIndex + 1).coerceAtMost(currentState.totalSections - 1)
             }
@@ -439,11 +435,11 @@ class DataEntryViewModel @Inject constructor(
     }
 
     fun goToPreviousSection() {
-        _state.update { currentState ->
+        _uiState.update { currentState ->
             if (currentState.totalSections == 0) return@update currentState
 
             val newIndex = if (currentState.currentSectionIndex == -1) {
-                currentState.totalSections - 1 // If nothing is open, "Previous" opens the last section
+                currentState.totalSections - 1
             } else {
                 (currentState.currentSectionIndex - 1).coerceAtLeast(0)
             }
@@ -453,7 +449,7 @@ class DataEntryViewModel @Inject constructor(
 
 
     fun toggleCategoryGroup(sectionName: String, categoryGroup: String) {
-        _state.update { currentState ->
+        _uiState.update { currentState ->
             val key = "$sectionName:$categoryGroup"
             val newExpanded = if (currentState.expandedCategoryGroup == key) null else key
             currentState.copy(expandedCategoryGroup = newExpanded)
@@ -461,18 +457,18 @@ class DataEntryViewModel @Inject constructor(
     }
 
     fun moveToNextStep(): Boolean {
-        val currentStep = _state.value.currentStep
-        val totalSteps = _state.value.dataValues.size
+        val currentStep = _uiState.value.currentStep
+        val totalSteps = _uiState.value.dataValues.size
         return if (currentStep < totalSteps - 1) {
-            _state.update { currentState ->
+            _uiState.update { currentState ->
                 currentState.copy(
                     currentStep = currentStep + 1,
-                    currentDataValue = _state.value.dataValues[currentStep + 1]
+                    currentDataValue = _uiState.value.dataValues[currentStep + 1]
                 )
             }
             false
         } else {
-            _state.update { currentState ->
+            _uiState.update { currentState ->
                 currentState.copy(
                     isEditMode = true,
                     isCompleted = true
@@ -483,12 +479,12 @@ class DataEntryViewModel @Inject constructor(
     }
 
     fun moveToPreviousStep(): Boolean {
-        val currentStep = _state.value.currentStep
+        val currentStep = _uiState.value.currentStep
         return if (currentStep > 0) {
-            _state.update { currentState ->
+            _uiState.update { currentState ->
                 currentState.copy(
                     currentStep = currentStep - 1,
-                    currentDataValue = _state.value.dataValues[currentStep - 1]
+                    currentDataValue = _uiState.value.dataValues[currentStep - 1]
                 )
             }
             true
@@ -530,12 +526,11 @@ class DataEntryViewModel @Inject constructor(
     }
 
     fun setNavigating(isNavigating: Boolean) {
-        _state.update { it.copy(isNavigating = isNavigating) }
+        _uiState.update { it.copy(isNavigating = isNavigating) }
     }
 
     fun resetSaveFeedback() {
-        _state.update { it.copy(saveResult = null, saveInProgress = false) }
-        // Don't reset savePressed here - only reset when new changes are made
+        _uiState.update { it.copy(saveResult = null, saveInProgress = false) }
     }
 
     fun wasSavePressed(): Boolean = savePressed
@@ -543,7 +538,7 @@ class DataEntryViewModel @Inject constructor(
     fun hasUnsavedChanges(): Boolean = dirtyDataValues.isNotEmpty()
 
     fun clearDraftsForCurrentInstance() {
-        val stateSnapshot = _state.value
+        val stateSnapshot = _uiState.value
         viewModelScope.launch(Dispatchers.IO) {
             draftDao.deleteDraftsForInstance(
                 stateSnapshot.datasetId,
@@ -552,7 +547,7 @@ class DataEntryViewModel @Inject constructor(
                 stateSnapshot.attributeOptionCombo
             )
             dirtyDataValues.clear()
-            savePressed = false // Reset save state when discarding changes
+            savePressed = false
             withContext(Dispatchers.Main) {
                 loadDataValues(
                     datasetId = stateSnapshot.datasetId,
@@ -566,17 +561,11 @@ class DataEntryViewModel @Inject constructor(
         }
     }
 
-    /**
-     * Clear only the current session's unsaved changes without affecting previously saved drafts
-     */
     fun clearCurrentSessionChanges() {
-        // Simply reset the dirty tracking and field states to their loaded values
-        val currentState = _state.value
+        val currentState = _uiState.value
 
-        // Reset field states to their loaded values from the database
         dirtyDataValues.clear()
 
-        // Reset field states to original loaded values
         _fieldStates.clear()
         currentState.dataValues.forEach { dataValue ->
             val key = "${dataValue.dataElement}|${dataValue.categoryOptionCombo}"
@@ -589,7 +578,7 @@ class DataEntryViewModel @Inject constructor(
     }
 
     fun toggleGridRow(sectionName: String, rowKey: String) {
-        _state.update { currentState ->
+        _uiState.update { currentState ->
             val currentSet = currentState.expandedGridRows[sectionName] ?: emptySet()
             val newSet =
                 if (currentSet.contains(rowKey)) currentSet - rowKey else currentSet + rowKey
@@ -602,16 +591,16 @@ class DataEntryViewModel @Inject constructor(
     }
 
     fun isGridRowExpanded(sectionName: String, rowKey: String): Boolean {
-        return _state.value.expandedGridRows[sectionName]?.contains(rowKey) == true
+        return _uiState.value.expandedGridRows[sectionName]?.contains(rowKey) == true
     }
 
     fun startValidationForCompletion() {
-        val stateSnapshot = _state.value
+        val stateSnapshot = _uiState.value
         viewModelScope.launch {
             Log.d("DataEntryViewModel", "=== COMPLETION FLOW: Starting validation for completion ===")
             Log.d("DataEntryViewModel", "Current isCompleted state: ${stateSnapshot.isCompleted}")
             Log.d("DataEntryViewModel", "Dataset: ${stateSnapshot.datasetId}, Period: ${stateSnapshot.period}, OrgUnit: ${stateSnapshot.orgUnit}")
-            _state.update { it.copy(isValidating = true, error = null, validationSummary = null) }
+            _uiState.update { it.copy(isValidating = true, error = null, validationSummary = null) }
             
             try {
                 val validationResult = validationRepository.validateDatasetInstance(
@@ -620,12 +609,12 @@ class DataEntryViewModel @Inject constructor(
                     organisationUnit = stateSnapshot.orgUnit,
                     attributeOptionCombo = stateSnapshot.attributeOptionCombo,
                     dataValues = stateSnapshot.dataValues,
-                    forceRefresh = true // Always refresh validation for completion
+                    forceRefresh = true
                 )
                 
                 Log.d("DataEntryViewModel", "Validation completed: ${validationResult.errorCount} errors, ${validationResult.warningCount} warnings")
                 
-                _state.update { 
+                _uiState.update {
                     it.copy(
                         isValidating = false, 
                         validationSummary = validationResult
@@ -634,7 +623,7 @@ class DataEntryViewModel @Inject constructor(
                 
             } catch (e: Exception) {
                 Log.e("DataEntryViewModel", "Error during validation: ${e.message}", e)
-                _state.update {
+                _uiState.update {
                     it.copy(
                         isValidating = false,
                         error = "Error during validation: ${e.message}"
@@ -645,12 +634,12 @@ class DataEntryViewModel @Inject constructor(
     }
 
     fun completeDatasetAfterValidation(onResult: (Boolean, String?) -> Unit) {
-        val stateSnapshot = _state.value
+        val stateSnapshot = _uiState.value
         viewModelScope.launch {
             Log.d("DataEntryViewModel", "=== COMPLETION FLOW: Proceeding with dataset completion after validation ===")
             Log.d("DataEntryViewModel", "Dataset: ${stateSnapshot.datasetId}, Period: ${stateSnapshot.period}, OrgUnit: ${stateSnapshot.orgUnit}")
             Log.d("DataEntryViewModel", "AttributeOptionCombo: ${stateSnapshot.attributeOptionCombo}")
-            _state.update { it.copy(isLoading = true, error = null) }
+            _uiState.update { it.copy(isLoading = true, error = null) }
             
             try {
                 val result = useCases.completeDatasetInstance(
@@ -669,11 +658,11 @@ class DataEntryViewModel @Inject constructor(
                     }
                     
                     Log.d("DataEntryViewModel", successMessage)
-                    _state.update { it.copy(isCompleted = true, isLoading = false, validationSummary = null) }
+                    _uiState.update { it.copy(isCompleted = true, isLoading = false, validationSummary = null) }
                     onResult(true, successMessage)
                 } else {
                     Log.e("DataEntryViewModel", "Failed to mark dataset as complete: ${result.exceptionOrNull()?.message}")
-                    _state.update {
+                    _uiState.update {
                         it.copy(
                             isLoading = false,
                             error = result.exceptionOrNull()?.message
@@ -684,7 +673,7 @@ class DataEntryViewModel @Inject constructor(
                 
             } catch (e: Exception) {
                 Log.e("DataEntryViewModel", "Error during completion: ${e.message}", e)
-                _state.update {
+                _uiState.update {
                     it.copy(
                         isLoading = false,
                         error = "Error during completion: ${e.message}"
@@ -696,12 +685,12 @@ class DataEntryViewModel @Inject constructor(
     }
 
     fun markDatasetIncomplete(onResult: (Boolean, String?) -> Unit) {
-        val stateSnapshot = _state.value
+        val stateSnapshot = _uiState.value
         viewModelScope.launch {
             Log.d("DataEntryViewModel", "=== COMPLETION FLOW: Marking dataset as incomplete ===")
             Log.d("DataEntryViewModel", "Dataset: ${stateSnapshot.datasetId}, Period: ${stateSnapshot.period}, OrgUnit: ${stateSnapshot.orgUnit}")
             Log.d("DataEntryViewModel", "AttributeOptionCombo: ${stateSnapshot.attributeOptionCombo}")
-            _state.update { it.copy(isLoading = true, error = null) }
+            _uiState.update { it.copy(isLoading = true, error = null) }
 
             try {
                 val result = useCases.markDatasetInstanceIncomplete(
@@ -712,7 +701,7 @@ class DataEntryViewModel @Inject constructor(
                 )
 
                 if (result.isSuccess) {
-                    _state.update {
+                    _uiState.update {
                         it.copy(
                             isLoading = false,
                             isCompleted = false,
@@ -722,18 +711,18 @@ class DataEntryViewModel @Inject constructor(
                     onResult(true, "Dataset marked as incomplete")
                 } else {
                     Log.e("DataEntryViewModel", "Failed to mark dataset incomplete: ${result.exceptionOrNull()}")
-                    _state.update { it.copy(isLoading = false, error = result.exceptionOrNull()?.message) }
+                    _uiState.update { it.copy(isLoading = false, error = result.exceptionOrNull()?.message) }
                     onResult(false, result.exceptionOrNull()?.message)
                 }
             } catch (e: Exception) {
                 Log.e("DataEntryViewModel", "Exception marking dataset incomplete: ${e.message}", e)
-                _state.update { it.copy(isLoading = false, error = e.message) }
+                _uiState.update { it.copy(isLoading = false, error = e.message) }
                 onResult(false, e.message)
             }
         }
     }
 
     fun clearValidationResult() {
-        _state.update { it.copy(validationSummary = null) }
+        _uiState.update { it.copy(validationSummary = null) }
     }
 }

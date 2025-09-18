@@ -18,7 +18,9 @@ data class SyncState(
     val lastSyncAttempt: Long? = null,
     val lastSuccessfulSync: Long? = null,
     val failedAttempts: Int = 0,
-    val error: String? = null
+    val error: String? = null,
+    val progress: Int = 0,
+    val step: String? = null
 )
 
 @Singleton
@@ -117,7 +119,9 @@ class SyncQueueManager @Inject constructor(
         _syncState.value = _syncState.value.copy(
             isRunning = true,
             lastSyncAttempt = System.currentTimeMillis(),
-            error = null
+            error = null,
+            progress = 0,
+            step = "Initializing sync..."
         )
         
         try {
@@ -134,18 +138,22 @@ class SyncQueueManager @Inject constructor(
             // Get all draft data values to sync
             val drafts = database.dataValueDraftDao().getAllDrafts()
             Log.d(tag, "Starting sync of ${drafts.size} draft values")
+            _syncState.value = _syncState.value.copy(progress = 10, step = "Found ${drafts.size} local changes")
 
             if (drafts.isEmpty()) {
                 _syncState.value = _syncState.value.copy(
                     isRunning = false,
                     queueSize = 0,
                     lastSuccessfulSync = System.currentTimeMillis(),
-                    failedAttempts = 0
+                    failedAttempts = 0,
+                    progress = 100,
+                    step = "No local changes to sync"
                 )
                 return
             }
 
             // Step 1: Set ALL drafts first in DHIS2 local database
+            _syncState.value = _syncState.value.copy(progress = 20, step = "Preparing data for upload...")
             Log.d(tag, "Setting ${drafts.size} draft values in DHIS2 local database")
             val allSuccessfulDrafts = mutableListOf<DataValueDraftEntity>()
 
@@ -179,6 +187,8 @@ class SyncQueueManager @Inject constructor(
             var lastException: Exception? = null
             var attempt = 0
             var uploadSuccessful = false
+
+            _syncState.value = _syncState.value.copy(progress = 40, step = "Uploading data to server...")
 
             while (attempt < maxRetryAttempts && !uploadSuccessful) {
                 try {
@@ -257,7 +267,9 @@ class SyncQueueManager @Inject constructor(
                 queueSize = database.dataValueDraftDao().getAllDrafts().size,
                 lastSuccessfulSync = if (allSuccessfulDrafts.isNotEmpty()) System.currentTimeMillis() else _syncState.value.lastSuccessfulSync,
                 failedAttempts = if (allSuccessfulDrafts.isNotEmpty()) 0 else _syncState.value.failedAttempts + 1,
-                error = if (allSuccessfulDrafts.isEmpty()) "Upload failed for all data values" else null
+                error = if (allSuccessfulDrafts.isEmpty()) "Upload failed for all data values" else null,
+                progress = 100,
+                step = "Sync complete"
             )
 
             Log.d(tag, "Sync completed - ${allSuccessfulDrafts.size} values uploaded successfully")
@@ -286,7 +298,9 @@ class SyncQueueManager @Inject constructor(
         _syncState.value = _syncState.value.copy(
             isRunning = true,
             lastSyncAttempt = System.currentTimeMillis(),
-            error = null
+            error = null,
+            progress = 0,
+            step = "Initializing sync..."
         )
 
         try {
@@ -306,18 +320,22 @@ class SyncQueueManager @Inject constructor(
             )
             Log.d(tag, "Starting sync for dataset instance: $datasetId, period: $period, orgUnit: $orgUnit")
             Log.d(tag, "Found ${drafts.size} draft values for this instance")
+            _syncState.value = _syncState.value.copy(progress = 10, step = "Found ${drafts.size} local changes")
 
             if (drafts.isEmpty()) {
                 _syncState.value = _syncState.value.copy(
                     isRunning = false,
                     queueSize = database.dataValueDraftDao().getAllDrafts().size,
                     lastSuccessfulSync = System.currentTimeMillis(),
-                    failedAttempts = 0
+                    failedAttempts = 0,
+                    progress = 100,
+                    step = "No local changes to sync"
                 )
                 return
             }
 
             // Step 1: Set ALL drafts for this instance in DHIS2 local database
+            _syncState.value = _syncState.value.copy(progress = 20, step = "Preparing data for upload...")
             Log.d(tag, "Setting ${drafts.size} draft values for instance in DHIS2 local database")
             val allSuccessfulDrafts = mutableListOf<DataValueDraftEntity>()
 
@@ -351,6 +369,8 @@ class SyncQueueManager @Inject constructor(
             var lastException: Exception? = null
             var attempt = 0
             var uploadSuccessful = false
+
+            _syncState.value = _syncState.value.copy(progress = 40, step = "Uploading data to server...")
 
             while (attempt < maxRetryAttempts && !uploadSuccessful) {
                 try {
@@ -429,7 +449,9 @@ class SyncQueueManager @Inject constructor(
                 queueSize = database.dataValueDraftDao().getAllDrafts().size,
                 lastSuccessfulSync = if (allSuccessfulDrafts.isNotEmpty()) System.currentTimeMillis() else _syncState.value.lastSuccessfulSync,
                 failedAttempts = if (allSuccessfulDrafts.isNotEmpty()) 0 else _syncState.value.failedAttempts + 1,
-                error = if (allSuccessfulDrafts.isEmpty()) "Upload failed for dataset instance" else null
+                error = if (allSuccessfulDrafts.isEmpty()) "Upload failed for dataset instance" else null,
+                progress = 100,
+                step = "Sync complete"
             )
 
             Log.d(tag, "Sync completed for instance - ${allSuccessfulDrafts.size} values uploaded successfully")

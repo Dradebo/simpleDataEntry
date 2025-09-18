@@ -35,9 +35,11 @@ fun BaseScreen(
         }
     },
     actions: @Composable (RowScope.() -> Unit) = {},
+    floatingActionButton: @Composable () -> Unit = {},
     content: @Composable () -> Unit
 ) {
     Scaffold(
+        floatingActionButton = floatingActionButton,
         topBar = {
             TopBar(
                 title = { Title(text = title, textColor = TextColor.OnPrimary) },
