@@ -33,97 +33,61 @@ class BackgroundSyncWorker @AssistedInject constructor(
     private val datasetsRepository: DatasetsRepository,
     private val datasetInstancesRepository: DatasetInstancesRepository,
     private val networkStateManager: NetworkStateManager,
-    private val database: AppDatabase
+    private val syncQueueManager: SyncQueueManager
 ) : CoroutineWorker(context, workerParams) {
-    
+
     companion object {
         const val TAG = "BackgroundSyncWorker"
         const val WORK_NAME = "background_sync_work"
     }
-    
-    private suspend fun updateProgress(step: String, progress: Int) {
-        setProgress(workDataOf(
-            "step" to step,
-            "progress" to progress
-        ))
+
+    private suspend fun updateProgress(step: String, progress: Int, error: String? = null) {
+        val dataBuilder = Data.Builder()
+            .putString("step", step)
+            .putInt("progress", progress)
+        error?.let { dataBuilder.putString("error", it) }
+        setProgress(dataBuilder.build())
     }
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
+        Log.d(TAG, "Starting background sync worker...")
+
+        if (!sessionManager.isSessionActive()) {
+            Log.d(TAG, "No active session, skipping sync.")
+            return@withContext Result.success()
+        }
+
+        if (!networkStateManager.isOnline()) {
+            Log.d(TAG, "No network connection, will retry later.")
+            return@withContext Result.retry()
+        }
+
         try {
-            updateProgress("Initializing sync...", 0)
-            Log.d(TAG, "Starting background sync...")
+            // Step 1: Sync metadata (datasets and instances)
+            updateProgress("Syncing metadata...", 10)
+            datasetsRepository.syncDatasets().getOrThrow()
+            updateProgress("Syncing instances...", 30)
+            datasetInstancesRepository.syncDatasetInstances() // Assuming this doesn't return a result to check
 
-            // Check if we have an active session
-            if (!sessionManager.isSessionActive()) {
-                Log.d(TAG, "No active session - skipping sync")
-                return@withContext Result.success()
-            }
+            // Step 2: Upload pending data
+            updateProgress("Uploading local data...", 60)
+            val uploadResult = syncQueueManager.startSync(forceSync = true)
 
-            // Check network connectivity
-            if (!networkStateManager.isOnline()) {
-                Log.d(TAG, "No network connectivity - skipping sync")
-                return@withContext Result.retry()
-            }
-
-            var syncSuccess = true
-            
-            // Sync datasets metadata
-            try {
-                updateProgress("Syncing datasets metadata...", 20)
-                Log.d(TAG, "Syncing datasets metadata...")
-                val datasetsResult = datasetsRepository.syncDatasets()
-                if (datasetsResult.isFailure) {
-                    Log.w(TAG, "Failed to sync datasets: ${datasetsResult.exceptionOrNull()}")
-                    syncSuccess = false
-                } else {
-                    updateProgress("Datasets metadata sync completed", 40)
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error syncing datasets", e)
-                syncSuccess = false
-            }
-
-            // Sync dataset instances
-            try {
-                updateProgress("Syncing dataset instances...", 50)
-                Log.d(TAG, "Syncing dataset instances...")
-                datasetInstancesRepository.syncDatasetInstances()
-                updateProgress("Dataset instances sync completed", 70)
-                Log.d(TAG, "Dataset instances sync completed successfully")
-            } catch (e: Exception) {
-                Log.e(TAG, "Error syncing dataset instances", e)
-                syncSuccess = false
-            }
-
-            // Upload pending data values (if any)
-            try {
-                updateProgress("Uploading pending data values...", 80)
-                Log.d(TAG, "Uploading pending data values...")
-                // Use SyncQueueManager to handle all pending uploads
-                val syncQueueManager = SyncQueueManager(networkStateManager, sessionManager, database)
-                syncQueueManager.startSync()
-                updateProgress("Data upload completed", 95)
-                Log.d(TAG, "Pending data upload completed")
-            } catch (e: Exception) {
-                Log.e(TAG, "Error uploading pending data", e)
-                syncSuccess = false
-            }
-            
-            val result = if (syncSuccess) {
-                updateProgress("Sync completed successfully", 100)
-                Log.d(TAG, "Background sync completed successfully")
+            return if (uploadResult.isSuccess) {
+                updateProgress("Sync completed", 100)
+                Log.d(TAG, "Background sync completed successfully.")
                 Result.success()
             } else {
-                updateProgress("Sync failed - will retry", 0)
-                Log.w(TAG, "Background sync completed with some failures - will retry")
-                Result.retry()
+                val error = uploadResult.exceptionOrNull()?.message ?: "Unknown upload error"
+                Log.e(TAG, "Background sync failed during data upload: $error")
+                updateProgress("Sync failed", 0, error)
+                Result.failure(workDataOf("error" to error))
             }
-            
-            return@withContext result
-            
+
         } catch (e: Exception) {
-            Log.e(TAG, "Background sync failed with exception", e)
-            return@withContext Result.retry()
+            Log.e(TAG, "Background sync failed with exception: ${e.message}", e)
+            updateProgress("Sync failed", 0, e.message)
+            return@withContext Result.failure(workDataOf("error" to e.message))
         }
     }
 }
