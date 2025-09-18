@@ -66,7 +66,8 @@ class DataEntryViewModel @Inject constructor(
     private val repository: DataEntryRepository,
     private val useCases: DataEntryUseCases,
     private val draftDao: DataValueDraftDao,
-    private val validationRepository: ValidationRepository
+    private val validationRepository: ValidationRepository,
+    private val syncQueueManager: com.ash.simpledataentry.data.sync.SyncQueueManager
 ) : ViewModel() {
     private val _state = MutableStateFlow(DataEntryState())
     val state: StateFlow<DataEntryState> = _state.asStateFlow()
@@ -330,116 +331,48 @@ class DataEntryViewModel @Inject constructor(
         }
     }
 
-    fun syncCurrentEntryForm() {
+    fun syncData() {
         viewModelScope.launch {
-            _state.update { it.copy(isLoading = true, error = null) }
             val stateSnapshot = _state.value
-            val isOnline = NetworkUtils.isNetworkAvailable(application)
-            if (!isOnline) {
-                _state.update { it.copy(isLoading = false, error = "Cannot sync while offline.") }
+            if (stateSnapshot.datasetId.isEmpty()) {
+                Log.e("DataEntryViewModel", "Cannot sync: datasetId is empty")
+                _state.update { it.copy(error = "Cannot sync, dataset information is missing.") }
                 return@launch
             }
 
-            try {
-                // 1. Load all drafts for the current instance
-                val drafts = withContext(Dispatchers.IO) {
-                    draftDao.getDraftsForInstance(
-                        stateSnapshot.datasetId,
-                        stateSnapshot.period,
-                        stateSnapshot.orgUnit,
-                        stateSnapshot.attributeOptionCombo
-                    )
-                }
-                Log.d("DataEntryViewModel", "Loaded ${'$'}{drafts.size} drafts for sync")
-
-                // 2. For each draft, stage value in SDK
-                val results = drafts.map { draft ->
-                    async(Dispatchers.IO) {
-                        useCases.saveDataValue(
-                            datasetId = draft.datasetId,
-                            period = draft.period,
-                            orgUnit = draft.orgUnit,
-                            attributeOptionCombo = draft.attributeOptionCombo,
-                            dataElement = draft.dataElement,
-                            categoryOptionCombo = draft.categoryOptionCombo,
-                            value = draft.value,
-                            comment = draft.comment
-                        )
-                    }
-                }.awaitAll()
-                val failed = results.filter { it.isFailure }
-                if (failed.isNotEmpty()) {
-                    Log.e(
-                        "DataEntryViewModel",
-                        "Failed to stage ${'$'}{failed.size} drafts: ${'$'}{failed.map { it.exceptionOrNull()?.message }}"
-                    )
-                    _state.update {
-                        it.copy(
-                            isLoading = false,
-                            error = "Failed to stage some values for upload."
-                        )
-                    }
-                    return@launch
-                }
-                Log.d("DataEntryViewModel", "All drafts staged in SDK")
-
-                // 3. Trigger upload
-                try {
-                    val uploadResult = withContext(Dispatchers.IO) {
-                        repository.syncCurrentEntryForm()
-                    }
-                    Log.d("DataEntryViewModel", "Data values uploaded successfully: $uploadResult")
-                    // Only delete drafts if uploadResult is not null/empty
-                    if (uploadResult != null && uploadResult.toString().isNotBlank()) {
-                        withContext(Dispatchers.IO) {
-                            draftDao.deleteDraftsForInstance(
-                                stateSnapshot.datasetId,
-                                stateSnapshot.period,
-                                stateSnapshot.orgUnit,
-                                stateSnapshot.attributeOptionCombo
-                            )
-                        }
-                        Log.d("DataEntryViewModel", "Drafts deleted after successful upload")
-                    } else {
-                        Log.e(
-                            "DataEntryViewModel",
-                            "Upload failed or returned empty result: $uploadResult"
-                        )
-                        _state.update {
-                            it.copy(
-                                isLoading = false,
-                                error = "Upload failed or returned empty result."
-                            )
-                        }
-                        return@launch
-                    }
-                } catch (e: Exception) {
-                    Log.e("DataEntryViewModel", "Upload failed: ${'$'}{e.message}", e)
-                    _state.update {
-                        it.copy(
-                            isLoading = false,
-                            error = "Upload failed: ${'$'}{e.message}"
-                        )
-                    }
-                    return@launch
-                }
-
-                // 4. Reload data values to refresh UI
-                loadDataValues(
-                    datasetId = _state.value.datasetId,
-                    datasetName = _state.value.datasetName,
-                    period = _state.value.period,
-                    orgUnitId = _state.value.orgUnit,
-                    attributeOptionCombo = _state.value.attributeOptionCombo,
-                    isEditMode = _state.value.isEditMode
-                )
+            if (!NetworkUtils.isNetworkAvailable(application)) {
+                _state.update { it.copy(error = "No network connection. Please connect and try again.") }
+                return@launch
             }
-            catch (e: Exception) {
-                null
+
+            _state.update { it.copy(isSyncing = true, error = null, successMessage = null) }
+
+            val result = syncQueueManager.startSyncForInstance(
+                datasetId = stateSnapshot.datasetId,
+                period = stateSnapshot.period,
+                orgUnit = stateSnapshot.orgUnit,
+                attributeOptionCombo = stateSnapshot.attributeOptionCombo,
+                forceSync = true
+            )
+
+            if (result.isSuccess) {
+                Log.d("DataEntryViewModel", "Sync for instance completed successfully.")
+                _state.update { it.copy(isSyncing = false, successMessage = "Data synced successfully!") }
+                // Reload data to reflect synced state
+                loadDataValues(
+                    datasetId = stateSnapshot.datasetId,
+                    datasetName = stateSnapshot.datasetName,
+                    period = stateSnapshot.period,
+                    orgUnitId = stateSnapshot.orgUnit,
+                    attributeOptionCombo = stateSnapshot.attributeOptionCombo,
+                    isEditMode = stateSnapshot.isEditMode
+                )
+            } else {
+                val errorMessage = result.exceptionOrNull()?.message ?: "Unknown error during sync."
+                Log.e("DataEntryViewModel", "Sync for instance failed: $errorMessage")
+                _state.update { it.copy(isSyncing = false, error = "Sync failed: $errorMessage") }
             }
         }
-
-
     }
 
     private fun loadDraftCount() {
@@ -457,101 +390,6 @@ class DataEntryViewModel @Inject constructor(
                 _state.update { it.copy(localDraftCount = draftCount) }
             } catch (e: Exception) {
                 Log.e("DataEntryViewModel", "Failed to load draft count", e)
-            }
-        }
-    }
-
-    fun syncDataEntry(uploadFirst: Boolean = false) {
-        val stateSnapshot = _state.value
-        if (stateSnapshot.datasetId.isEmpty()) {
-            Log.e("DataEntryViewModel", "Cannot sync: datasetId is empty")
-            return
-        }
-
-        Log.d("DataEntryViewModel", "Starting sync for data entry: datasetId=${stateSnapshot.datasetId}, uploadFirst: $uploadFirst")
-        viewModelScope.launch {
-            _state.update { it.copy(isSyncing = true, error = null, successMessage = null) }
-            try {
-                if (!NetworkUtils.isNetworkAvailable(application)) {
-                    _state.update { 
-                        it.copy(
-                            isSyncing = false, 
-                            error = "No network connection. Sync will be attempted when online."
-                        ) 
-                    }
-                    return@launch
-                }
-                
-                if (uploadFirst) {
-                    Log.d("DataEntryViewModel", "Step 1: Uploading local data for current dataset instance")
-                    // 1. Push only this dataset instance's data to server first
-                    repository.pushDataForInstance(
-                        datasetId = stateSnapshot.datasetId,
-                        period = stateSnapshot.period,
-                        orgUnit = stateSnapshot.orgUnit,
-                        attributeOptionCombo = stateSnapshot.attributeOptionCombo
-                    )
-                    Log.d("DataEntryViewModel", "Step 1 completed: Instance data uploaded")
-
-                    // Immediately update draft count after successful upload
-                    loadDraftCount()
-                }
-                
-                Log.d("DataEntryViewModel", "Step 2: Pulling remote updates")
-                // 2. Pull updates from server and harmonize
-                val result = useCases.syncDataEntry()
-                result.fold(
-                    onSuccess = {
-                        // Reload all data after sync
-                        loadDataValues(
-                            datasetId = stateSnapshot.datasetId,
-                            datasetName = stateSnapshot.datasetName,
-                            period = stateSnapshot.period,
-                            orgUnitId = stateSnapshot.orgUnit,
-                            attributeOptionCombo = stateSnapshot.attributeOptionCombo,
-                            isEditMode = stateSnapshot.isEditMode
-                        )
-                        val message = if (uploadFirst) {
-                            "Local data uploaded and remote updates downloaded successfully"
-                        } else {
-                            "Data entry synced successfully"
-                        }
-                        _state.update { 
-                            it.copy(
-                                isSyncing = false,
-                                successMessage = message
-                            ) 
-                        }
-                        Log.d("DataEntryViewModel", "Sync completed successfully")
-                    },
-                    onFailure = { error ->
-                        Log.e("DataEntryViewModel", "Sync failed", error)
-                        val errorMessage = if (uploadFirst) {
-                            "Upload succeeded but failed to download updates: ${error.message}"
-                        } else {
-                            error.message ?: "Failed to sync data entry"
-                        }
-                        _state.update { 
-                            it.copy(
-                                isSyncing = false,
-                                error = errorMessage
-                            ) 
-                        }
-                    }
-                )
-            } catch (e: Exception) {
-                Log.e("DataEntryViewModel", "Sync failed", e)
-                val errorMessage = if (uploadFirst) {
-                    "Sync failed during ${if (e.message?.contains("upload") == true) "upload" else "download"}: ${e.message}"
-                } else {
-                    e.message ?: "Failed to sync data entry"
-                }
-                _state.update { 
-                    it.copy(
-                        isSyncing = false,
-                        error = errorMessage
-                    ) 
-                }
             }
         }
     }

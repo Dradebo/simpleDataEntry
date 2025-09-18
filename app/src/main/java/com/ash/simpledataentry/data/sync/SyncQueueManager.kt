@@ -52,21 +52,6 @@ class SyncQueueManager @Inject constructor(
     private val maxChunkSize = 50 // Maximum data values per upload chunk
     private val minChunkSize = 10 // Minimum chunk size for poor networks
     
-    init {
-        startNetworkMonitoring()
-    }
-    
-    private fun startNetworkMonitoring() {
-        networkMonitorJob = syncScope.launch {
-            networkStateManager.networkState.collect { networkState ->
-                if (networkState.hasInternet && _syncState.value.queueSize > 0 && !_syncState.value.isRunning) {
-                    Log.d(tag, "Network available, starting queued sync")
-                    startSync()
-                }
-            }
-        }
-    }
-    
     suspend fun queueForSync() {
         val currentQueueSize = database.dataValueDraftDao().getAllDrafts().size
         _syncState.value = _syncState.value.copy(queueSize = currentQueueSize)
