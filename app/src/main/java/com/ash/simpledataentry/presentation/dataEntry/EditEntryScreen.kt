@@ -87,7 +87,9 @@ fun EditEntryScreen(
     orgUnit: String,
     attributeOptionCombo: String
 ) {
-    val state by viewModel.state.collectAsState()
+    val combinedState by viewModel.combinedState.collectAsState()
+    val state = combinedState.uiState
+    val syncState = combinedState.syncState
     var lastLoadedParams by remember { mutableStateOf(Quadruple("", "", "", "")) }
     val currentParams = Quadruple(datasetId, period, orgUnit, attributeOptionCombo)
     val snackbarHostState = remember { SnackbarHostState() }
@@ -377,13 +379,13 @@ fun EditEntryScreen(
             // Add sync button to top bar
             IconButton(
                 onClick = {
-                    Log.d("EditEntryScreen", "Sync button clicked! Current isSyncing: ${state.isSyncing}, localDraftCount: ${state.localDraftCount}")
+                    Log.d("EditEntryScreen", "Sync button clicked! Current isSyncing: ${syncState.isRunning}, localDraftCount: ${state.localDraftCount}")
                     showSyncDialog.value = true
                     Log.d("EditEntryScreen", "showSyncDialog set to true")
                 },
-                enabled = !state.isSyncing
+                enabled = !syncState.isRunning
             ) {
-                if (state.isSyncing) {
+                if (syncState.isRunning) {
                     CircularProgressIndicator(
                         modifier = Modifier.size(24.dp),
                         strokeWidth = 2.dp,
@@ -428,7 +430,9 @@ fun EditEntryScreen(
         // Use OverlayLoader for sync operations (header actions)
         OverlayLoader(
             message = "Syncing...",
-            isVisible = state.isSyncing,
+            isVisible = syncState.isRunning,
+            progress = syncState.progress,
+            progressStep = syncState.step,
             modifier = Modifier.fillMaxSize()
         ) {
             if (state.isLoading || !isUIReady) {

@@ -102,7 +102,9 @@ fun DatasetsScreen(
 ) {
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
-    val datasetsState by viewModel.uiState.collectAsState()
+    val combinedState by viewModel.combinedState.collectAsState()
+    val datasetsState = combinedState.uiState
+    val syncState = combinedState.syncState
     val snackbarHostState = remember { SnackbarHostState() }
     var showDeleteConfirmation by remember { mutableStateOf(false) }
     var showFilterSection by remember { mutableStateOf(false) }
@@ -197,12 +199,12 @@ fun DatasetsScreen(
                 // Sync button with loading indicator
                 IconButton(
                     onClick = {
-                        if ((datasetsState as? DatasetsState.Success)?.isSyncing != true) {
+                        if (!syncState.isRunning) {
                             viewModel.syncDatasets()
                         }
                     }
                 ) {
-                    if ((datasetsState as? DatasetsState.Success)?.isSyncing == true) {
+                    if (syncState.isRunning) {
                         CircularProgressIndicator(
                             modifier = Modifier.size(24.dp),
                             strokeWidth = 2.dp,
@@ -244,9 +246,9 @@ fun DatasetsScreen(
             // Use OverlayLoader for sync operations
             OverlayLoader(
                 message = "Syncing datasets...",
-                isVisible = (datasetsState as? DatasetsState.Success)?.isSyncing ?: false,
-                progress = (datasetsState as? DatasetsState.Success)?.syncProgress,
-                progressStep = (datasetsState as? DatasetsState.Success)?.syncStep,
+                isVisible = syncState.isRunning,
+                progress = syncState.progress,
+                progressStep = syncState.step,
                 modifier = Modifier.fillMaxSize()
             ) {
                 Column {
