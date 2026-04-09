@@ -140,13 +140,17 @@ fun AppNavigation(
 
 
         composable(
-            route = "EditEntry/{datasetId}/{period}/{orgUnit}/{attributeOptionCombo}/{datasetName}",
+            route = "EditEntry/{datasetId}/{period}/{orgUnit}/{attributeOptionCombo}/{datasetName}?isNewEntry={isNewEntry}",
             arguments = listOf(
                 navArgument("datasetId") { type = NavType.StringType },
                 navArgument("period") { type = NavType.StringType },
                 navArgument("orgUnit") { type = NavType.StringType },
                 navArgument("attributeOptionCombo") { type = NavType.StringType },
-                navArgument("datasetName") { type = NavType.StringType }
+                navArgument("datasetName") { type = NavType.StringType },
+                navArgument("isNewEntry") {
+                    type = NavType.BoolType
+                    defaultValue = false
+                }
             )
         ) { backStackEntry ->
             val datasetId = backStackEntry.arguments?.getString("datasetId") ?: ""
@@ -154,6 +158,7 @@ fun AppNavigation(
             val orgUnit = backStackEntry.arguments?.getString("orgUnit") ?: ""
             val attributeOptionCombo = backStackEntry.arguments?.getString("attributeOptionCombo") ?: ""
             val datasetName = backStackEntry.arguments?.getString("datasetName") ?: ""
+            val isNewEntry = backStackEntry.arguments?.getBoolean("isNewEntry") ?: false
             val viewModel: DataEntryViewModel = hiltViewModel()
             EditEntryScreen(
                 viewModel = viewModel,
@@ -162,7 +167,8 @@ fun AppNavigation(
                 datasetName = datasetName,
                 period = period,
                 orgUnit = orgUnit,
-                attributeOptionCombo = attributeOptionCombo
+                attributeOptionCombo = attributeOptionCombo,
+                isNewEntry = isNewEntry
             )
         }
 

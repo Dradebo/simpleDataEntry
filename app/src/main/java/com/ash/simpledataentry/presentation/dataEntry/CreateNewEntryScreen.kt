@@ -221,7 +221,7 @@ fun CreateNewEntryScreen(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .clickable {
-                                        if (orgUnits.size <= 1) {
+                                        if (orgUnits.isEmpty()) {
                                             coroutineScope.launch {
                                                 snackbarHostState.showSnackbar(
                                                     message = selectedOrgUnit?.let { "Using ${it.name}" }
@@ -237,7 +237,7 @@ fun CreateNewEntryScreen(
                                     value = selectedOrgUnit?.name ?: "Select Organization Unit",
                                     onValueChange = {},
                                     readOnly = true,
-                                    enabled = false,
+                                    enabled = true,
                                     label = { Text("Organization Unit") },
                                     trailingIcon = {
                                         Icon(
@@ -295,47 +295,38 @@ fun CreateNewEntryScreen(
                             }
 
                             // Attribute Option Combo Dropdown
-                            ExposedDropdownMenuBox(
-                                expanded = expandedAttributeOptionCombo && !isDefaultOnlyAttrCombo,
-                                onExpandedChange = {
-                                    if (!isDefaultOnlyAttrCombo) {
+                            if (!isDefaultOnlyAttrCombo) {
+                                ExposedDropdownMenuBox(
+                                    expanded = expandedAttributeOptionCombo,
+                                    onExpandedChange = {
                                         expandedAttributeOptionCombo = !expandedAttributeOptionCombo
                                     }
-                                }
-                            ) {
-                                OutlinedTextField(
-                                    value = selectedAttrComboName.ifBlank {
-                                        if (isDefaultOnlyAttrCombo) {
-                                            "Default"
-                                        } else {
-                                            "Select Attribute Option Combo"
-                                        }
-                                    },
-                                    onValueChange = {},
-                                    readOnly = true,
-                                    enabled = !isDefaultOnlyAttrCombo,
-                                    label = { Text("Attribute Option Combo") },
-                                    trailingIcon = {
-                                        if (!isDefaultOnlyAttrCombo) {
-                                            ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedAttributeOptionCombo)
-                                        }
-                                    },
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .menuAnchor(MenuAnchorType.PrimaryNotEditable, enabled = !isDefaultOnlyAttrCombo)
-                                )
-                                ExposedDropdownMenu(
-                                    expanded = expandedAttributeOptionCombo && !isDefaultOnlyAttrCombo,
-                                    onDismissRequest = { expandedAttributeOptionCombo = false }
                                 ) {
-                                    attributeOptionCombos.forEach { (uid, displayName) ->
-                                        DropdownMenuItem(
-                                            text = { Text(displayName) },
-                                            onClick = {
-                                                selectedAttributeOptionCombo = uid
-                                                expandedAttributeOptionCombo = false
-                                            }
-                                        )
+                                    OutlinedTextField(
+                                        value = selectedAttrComboName.ifBlank { "Select Attribute Option Combo" },
+                                        onValueChange = {},
+                                        readOnly = true,
+                                        label = { Text("Attribute Option Combo") },
+                                        trailingIcon = {
+                                            ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedAttributeOptionCombo)
+                                        },
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .menuAnchor(MenuAnchorType.PrimaryNotEditable, enabled = true)
+                                    )
+                                    ExposedDropdownMenu(
+                                        expanded = expandedAttributeOptionCombo,
+                                        onDismissRequest = { expandedAttributeOptionCombo = false }
+                                    ) {
+                                        attributeOptionCombos.forEach { (uid, displayName) ->
+                                            DropdownMenuItem(
+                                                text = { Text(displayName) },
+                                                onClick = {
+                                                    selectedAttributeOptionCombo = uid
+                                                    expandedAttributeOptionCombo = false
+                                                }
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -366,7 +357,7 @@ fun CreateNewEntryScreen(
                                             val encodedOrgUnit = java.net.URLEncoder.encode(selectedOrgUnit!!.id, "UTF-8")
                                             val encodedAttributeOptionCombo = java.net.URLEncoder.encode(resolvedAttributeOptionCombo, "UTF-8")
                                             navController.navigate(
-                                                "EditEntry/$datasetId/$encodedPeriod/$encodedOrgUnit/$encodedAttributeOptionCombo/$encodedDatasetName"
+                                                "EditEntry/$datasetId/$encodedPeriod/$encodedOrgUnit/$encodedAttributeOptionCombo/$encodedDatasetName?isNewEntry=true"
                                             ) {
                                                 popUpTo("CreateDataEntry/$datasetId/$datasetName") { inclusive = true }
                                             }

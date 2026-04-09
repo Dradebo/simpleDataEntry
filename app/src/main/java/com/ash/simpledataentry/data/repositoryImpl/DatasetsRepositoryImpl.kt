@@ -2,6 +2,7 @@ package com.ash.simpledataentry.data.repositoryImpl
 
 import android.util.Log
 import com.ash.simpledataentry.data.DatabaseProvider
+import com.ash.simpledataentry.data.D2Provider
 import com.ash.simpledataentry.data.SessionManager
 import com.ash.simpledataentry.domain.model.*
 import com.ash.simpledataentry.domain.repository.DatasetsRepository
@@ -20,16 +21,21 @@ import java.util.Date
 import com.ash.simpledataentry.util.NetworkUtils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.rx2.await
 
 class DatasetsRepositoryImpl(
     private val sessionManager: SessionManager,
     private val databaseProvider: DatabaseProvider,
     private val context: android.content.Context,
-    private val datasetInstancesRepository: com.ash.simpledataentry.domain.repository.DatasetInstancesRepository
+    private val datasetInstancesRepository: com.ash.simpledataentry.domain.repository.DatasetInstancesRepository,
+    private val d2Provider: D2Provider
 ) : DatasetsRepository {
 
     private val TAG = "DatasetsRepositoryImpl"
-    private val d2 get() = sessionManager.getD2()!!
+    /**
+     * Use d2Provider.awaitD2() in suspend functions for safe, non-racing access.
+     */
+    private val d2: D2? get() = d2Provider.getD2OrNull()
 
     // Lazy DAO accessors - always get from current account's database
     private val datasetDao get() = databaseProvider.getCurrentDatabase().datasetDao()
@@ -39,27 +45,35 @@ class DatasetsRepositoryImpl(
     /**
      * Fetches all datasets from Room database.
      * Account isolation ensures each account sees only their own data.
+     * Uses batch count to avoid N+1 query problem (was making 1 SDK call per dataset).
      */
     override fun getDatasets(): Flow<List<Dataset>> {
         return datasetDao.getAll()
             .map { entities ->
                 withContext(Dispatchers.IO) {
+                    // Batch fetch all instance counts in ONE query instead of N queries
+                    val datasetIds = entities.map { it.id }
+                    val counts = datasetInstancesRepository.getDatasetInstanceCounts(datasetIds)
+
                     entities.map { entity ->
-                        val instanceCount = datasetInstancesRepository.getDatasetInstanceCount(entity.id)
-                        entity.toDomainModel().copy(instanceCount = instanceCount)
+                        entity.toDomainModel().copy(instanceCount = counts[entity.id] ?: 0)
                     }
                 }
             }
     }
 
     override suspend fun syncDatasets(): Result<Unit> {
+        val d2Instance = d2 ?: run {
+            Log.w(TAG, "D2 session not available for syncDatasets")
+            return Result.failure(Exception("D2 session not available"))
+        }
         return try {
             Log.d(TAG, "Syncing dataset DATA (metadata already downloaded during login)")
             // PHASE 3 FIX: Don't retrigger full metadata download - just sync data
             // Metadata is already downloaded by SessionManager during login
             // This method should only download AGGREGATE DATA, not metadata
             withContext(Dispatchers.IO) {
-                d2.aggregatedModule().data().blockingDownload()
+                d2Instance.aggregatedModule().data().blockingDownload()
             }
             Log.d(TAG, "Dataset data sync completed successfully")
             Result.success(Unit)
@@ -71,16 +85,21 @@ class DatasetsRepositoryImpl(
 
     override suspend fun filterDatasets(period: String?, syncStatus: Boolean?): Result<List<Dataset>> {
         return try {
+            val d2Instance = d2Provider.awaitD2()
             Log.d(TAG, "Filtering datasets - period: $period, syncStatus: $syncStatus")
             val datasets = withContext(Dispatchers.IO) {
-                d2.dataSetModule()
+                val rawDatasets = d2Instance.dataSetModule()
                     .dataSets()
-                    .blockingGet()
-                    .map { dataSet ->
-                        val dataset = dataSet.toDomainModel()
-                        val instanceCount = datasetInstancesRepository.getDatasetInstanceCount(dataset.id)
-                        dataset.copy(instanceCount = instanceCount)
-                    }
+                    .get().await()
+
+                // Batch fetch all instance counts in ONE query
+                val datasetIds = rawDatasets.map { it.uid() }
+                val counts = datasetInstancesRepository.getDatasetInstanceCounts(datasetIds)
+
+                rawDatasets.map { dataSet ->
+                    val dataset = dataSet.toDomainModel()
+                    dataset.copy(instanceCount = counts[dataset.id] ?: 0)
+                }
             }
 
             Log.d(TAG, "Found ${datasets.size} datasets after filtering")
@@ -150,13 +169,17 @@ class DatasetsRepositoryImpl(
     }
 
     override suspend fun syncPrograms(): Result<Unit> {
+        val d2Instance = d2 ?: run {
+            Log.w(TAG, "D2 session not available for syncPrograms")
+            return Result.failure(Exception("D2 session not available"))
+        }
         return try {
             Log.d(TAG, "Syncing program DATA (metadata already downloaded during login)")
             // PHASE 3 FIX: Don't retrigger full metadata download - just sync tracker/event data
             // Metadata is already downloaded by SessionManager during login
             // This method should only download TRACKER/EVENT DATA, not metadata
             withContext(Dispatchers.IO) {
-                d2.trackedEntityModule().trackedEntityInstanceDownloader()
+                d2Instance.trackedEntityModule().trackedEntityInstanceDownloader()
                     .limit(500) // Reasonable limit to prevent timeouts
                     .blockingDownload()
             }

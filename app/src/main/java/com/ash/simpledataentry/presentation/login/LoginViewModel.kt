@@ -222,12 +222,27 @@ class LoginViewModel @Inject constructor(
                     )
                     _uiState.value = UiState.Loading(LoadingOperation.Navigation(offlineProgress))
 
-                    authRepository.attemptOfflineLogin(
+                    val offlineResult = authRepository.attemptOfflineLogin(
                         username = username,
                         password = password,
                         serverUrl = serverUrl,
                         context = context
                     )
+
+                    if (offlineResult) {
+                        true
+                    } else {
+                        // Offline failed; fall back to online login
+                        android.util.Log.d("LoginViewModel", "Offline login failed, attempting online login")
+                        authRepository.loginWithProgress(
+                            username = username,
+                            password = password,
+                            serverUrl = serverUrl,
+                            context = context
+                        ) { progress ->
+                            _uiState.value = UiState.Loading(LoadingOperation.Navigation(progress))
+                        }
+                    }
                 } else {
                     // Fall back to online login with progress tracking
                     android.util.Log.d("LoginViewModel", "Offline login not possible, attempting online login")
@@ -265,7 +280,7 @@ class LoginViewModel @Inject constructor(
                 } else {
                     val failureData = loadingData.copy(showSplash = false)
                     val errorMessage = if (canLoginOffline) {
-                        "Offline login failed - try connecting to the internet"
+                        "Offline login failed and online login was unsuccessful"
                     } else {
                         "Login failed: Invalid credentials or server error"
                     }
@@ -430,12 +445,30 @@ class LoginViewModel @Inject constructor(
                     )
                     _uiState.value = UiState.Loading(LoadingOperation.Navigation(offlineProgress))
 
-                    authRepository.attemptOfflineLogin(
+                    val offlineResult = authRepository.attemptOfflineLogin(
                         username = account.username,
                         password = decryptedPassword,
                         serverUrl = account.serverUrl,
                         context = context
                     )
+
+                    if (offlineResult) {
+                        true
+                    } else {
+                        // Offline failed; fall back to online login
+                        android.util.Log.d("LoginViewModel", "Offline login failed, attempting online login")
+                        val initialProgress = NavigationProgress.initial()
+                        _uiState.value = UiState.Loading(LoadingOperation.Navigation(initialProgress))
+
+                        authRepository.loginWithProgress(
+                            username = account.username,
+                            password = decryptedPassword,
+                            serverUrl = account.serverUrl,
+                            context = context
+                        ) { progress ->
+                            _uiState.value = UiState.Loading(LoadingOperation.Navigation(progress))
+                        }
+                    }
                 } else {
                     // Fall back to online login with progress tracking
                     android.util.Log.d("LoginViewModel", "Offline login not possible, attempting online login")
@@ -464,7 +497,7 @@ class LoginViewModel @Inject constructor(
                 } else {
                     val failureData = loadingData.copy(showSplash = false)
                     val errorMessage = if (canLoginOffline) {
-                        "Offline login failed - try connecting to the internet"
+                        "Offline login failed and online login was unsuccessful"
                     } else {
                         "Login failed: Invalid credentials or server error"
                     }

@@ -9,6 +9,11 @@ interface DatasetInstancesRepository {
     // Existing dataset methods
     suspend fun getDatasetInstances(datasetId: String): List<DatasetInstance>
     suspend fun getDatasetInstanceCount(datasetId: String, orgUnitIds: Set<String>? = null): Int
+    /**
+     * Batch fetch instance counts for multiple datasets in a single query.
+     * This avoids the N+1 query problem when loading the dataset list.
+     */
+    suspend fun getDatasetInstanceCounts(datasetIds: List<String>): Map<String, Int>
     suspend fun syncDatasetInstances()
     suspend fun completeDatasetInstance(datasetId: String, period: String, orgUnit: String, attributeOptionCombo: String): Result<Unit>
     suspend fun markDatasetInstanceIncomplete(datasetId: String, period: String, orgUnit: String, attributeOptionCombo: String): Result<Unit>

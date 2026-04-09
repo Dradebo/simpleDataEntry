@@ -12,6 +12,8 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.rx2.await
 import com.ash.simpledataentry.data.SessionManager
 import com.ash.simpledataentry.data.DatabaseProvider
+import com.ash.simpledataentry.data.D2Provider
+import com.ash.simpledataentry.data.cache.OrgUnitCacheService
 import com.ash.simpledataentry.data.local.DraftInstanceSummary
 import org.hisp.dhis.android.core.D2
 import org.hisp.dhis.android.core.organisationunit.OrganisationUnit
@@ -21,10 +23,15 @@ private const val TAG = "DatasetInstancesRepo"
 
 class DatasetInstancesRepositoryImpl @Inject constructor(
     private val sessionManager: SessionManager,
-    private val databaseProvider: DatabaseProvider
+    private val databaseProvider: DatabaseProvider,
+    private val d2Provider: D2Provider,
+    private val orgUnitCache: OrgUnitCacheService
 ) : DatasetInstancesRepository {
 
-    private val d2 get() = sessionManager.getD2()!!
+    /**
+     * Use d2Provider.awaitD2() in suspend functions for safe, non-racing access.
+     */
+    private val d2: D2? get() = d2Provider.getD2OrNull()
 
     // Lazy DAO accessors - always get from current account's database
     private val trackerEnrollmentDao get() = databaseProvider.getCurrentDatabase().trackerEnrollmentDao()
@@ -33,19 +40,19 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
     override suspend fun getDatasetInstances(datasetId: String): List<DatasetInstance> {
         Log.d(TAG, "Fetching dataset instances for dataset: $datasetId")
         return withContext(Dispatchers.IO) {
+            val d2Instance = d2Provider.awaitD2()
             try {
                 Log.d(TAG, "Fetching scoped org units and dataset attachments for $datasetId")
 
-                val scopedOrgUnits = d2.organisationUnitModule().organisationUnits()
-                    .byOrganisationUnitScope(OrganisationUnit.Scope.SCOPE_DATA_CAPTURE)
-                    .get().await()
+                // Use cached scoped org units
+                val scopedOrgUnits = orgUnitCache.getScopedOrgUnits()
 
                 if (scopedOrgUnits.isEmpty()) {
                     Log.e(TAG, "No organization units found in data capture scope")
                     return@withContext emptyList()
                 }
 
-                val attachedOrgUnits = d2.organisationUnitModule().organisationUnits()
+                val attachedOrgUnits = d2Instance.organisationUnitModule().organisationUnits()
                     .byDataSetUids(listOf(datasetId))
                     .get().await()
 
@@ -59,19 +66,12 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
                 )
 
                 // Get dataset instances across all relevant org units
-                val instanceCount = d2.dataSetModule()
-                    .dataSetInstances()
-                    .byDataSetUid().eq(datasetId)
-                    .byOrganisationUnitUid().`in`(relevantOrgUnitIds.toList())
-                    .blockingCount()
-
-                val instances = d2.dataSetModule()
+                val instances = d2Instance.dataSetModule()
                     .dataSetInstances()
                     .byDataSetUid().eq(datasetId)
                     .byOrganisationUnitUid().`in`(relevantOrgUnitIds.toList())
                     .get().await()
 
-                Log.d(TAG, "Found $instanceCount instances for dataset")
                 Log.d(TAG, "Loaded ${instances.size} instances for dataset")
 
 
@@ -108,7 +108,7 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
                     
                     // Get org unit name from DHIS2 SDK
                     val orgUnitName = try {
-                        d2.organisationUnitModule().organisationUnits()
+                        d2Instance.organisationUnitModule().organisationUnits()
                             .uid(draft.orgUnit)
                             .get().await()?.displayName() ?: draft.orgUnit
                     } catch (e: Exception) {
@@ -144,19 +144,23 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
     override suspend fun syncDatasetInstances() {
         Log.d(TAG, "Starting complete data sync (datasets, tracker, events)")
         withContext(Dispatchers.IO) {
+            val d2Instance = d2 ?: run {
+                Log.w(TAG, "D2 session not available for syncDatasetInstances")
+                return@withContext
+            }
             try {
                 // Upload local changes to dataset instances
-               // d2.dataSetModule().dataSetInstances().blockingUpload()
+               // d2Instance.dataSetModule().dataSetInstances().blockingUpload()
 
                 // Download latest dataset instances from server
                 Log.d(TAG, "Syncing dataset instances...")
-                d2.dataSetModule().dataSetInstances().get().await()
+                d2Instance.dataSetModule().dataSetInstances().get().await()
 
                 // Download tracker data (enrollments and their events)
                 Log.d(TAG, "Syncing tracker data...")
 
                 // Get tracker programs
-                val trackerPrograms = d2.programModule().programs()
+                val trackerPrograms = d2Instance.programModule().programs()
                     .byProgramType().eq(org.hisp.dhis.android.core.program.ProgramType.WITH_REGISTRATION)
                     .get().await()
 
@@ -171,20 +175,20 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
                         val programUid = program.uid()
                         Log.d(TAG, "Syncing tracker data for program: $programUid")
 
-                        d2.trackedEntityModule().trackedEntityInstanceDownloader()
+                        d2Instance.trackedEntityModule().trackedEntityInstanceDownloader()
                             .byProgramUid(programUid)
                             .download()
                     }
                 } else {
                     Log.d(TAG, "No tracker programs found, downloading all tracker data")
                     // Fallback: download all tracker data without program filter
-                    d2.trackedEntityModule().trackedEntityInstanceDownloader()
+                    d2Instance.trackedEntityModule().trackedEntityInstanceDownloader()
                         .download()
                 }
 
                 // Download standalone events using official pattern
                 Log.d(TAG, "Syncing event data...")
-                d2.eventModule().eventDownloader()
+                d2Instance.eventModule().eventDownloader()
                     .download()
 
                 Log.d(TAG, "Complete sync completed successfully")
@@ -198,9 +202,11 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
     override suspend fun completeDatasetInstance(datasetId: String, period: String, orgUnit: String, attributeOptionCombo: String): Result<Unit> {
         return withContext(Dispatchers.IO) {
             try {
+                val d2Instance = d2Provider.awaitD2()
                 Log.d(TAG, "Marking dataset as complete: $datasetId, $period, $orgUnit, $attributeOptionCombo")
-                d2.dataSetModule().dataSetCompleteRegistrations().value(period,orgUnit,datasetId,attributeOptionCombo).blockingSet()
-                d2.dataSetModule().dataSetCompleteRegistrations().blockingUpload()
+                // These are mutation operations - use blocking versions (run on IO dispatcher)
+                d2Instance.dataSetModule().dataSetCompleteRegistrations().value(period,orgUnit,datasetId,attributeOptionCombo).blockingSet()
+                d2Instance.dataSetModule().dataSetCompleteRegistrations().blockingUpload()
                 Log.d(TAG, "Dataset marked as complete successfully.")
                 Result.success(Unit)
             } catch (e: Exception) {
@@ -213,12 +219,11 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
     override suspend fun getDatasetInstanceCount(datasetId: String, orgUnitIds: Set<String>?): Int {
         return withContext(Dispatchers.IO) {
             try {
+                val d2Instance = d2Provider.awaitD2()
                 Log.d(TAG, "Getting instance count for dataset: $datasetId")
 
-                // Get scoped org units
-                val scopedOrgUnits = d2.organisationUnitModule().organisationUnits()
-                    .byOrganisationUnitScope(OrganisationUnit.Scope.SCOPE_DATA_CAPTURE)
-                    .get().await()
+                // Use cached scoped org units
+                val scopedOrgUnits = orgUnitCache.getScopedOrgUnits()
 
                 if (scopedOrgUnits.isEmpty()) {
                     Log.e(TAG, "No organization units found in data capture scope")
@@ -229,7 +234,7 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
                 val relevantOrgUnitIds = if (orgUnitIds != null) {
                     orgUnitIds.intersect(scopedIds)
                 } else {
-                    val attachedOrgUnits = d2.organisationUnitModule().organisationUnits()
+                    val attachedOrgUnits = d2Instance.organisationUnitModule().organisationUnits()
                         .byDataSetUids(listOf(datasetId))
                         .get().await()
                     val attachedIds = attachedOrgUnits.map { it.uid() }.toSet()
@@ -242,12 +247,13 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
                 }
 
                 // Count dataset instances across all relevant org units
-                val count = d2.dataSetModule()
+                val instances = d2Instance.dataSetModule()
                     .dataSetInstances()
                     .byDataSetUid().eq(datasetId)
                     .byOrganisationUnitUid().`in`(relevantOrgUnitIds.toList())
-                    .blockingCount()
+                    .get().await()
 
+                val count = instances.size
                 Log.d(TAG, "Found $count instances for dataset $datasetId")
                 count
             } catch (e: Exception) {
@@ -257,13 +263,59 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
         }
     }
 
+    /**
+     * Batch fetch instance counts for multiple datasets in a single query.
+     * This avoids the N+1 query problem when loading the dataset list.
+     * Gets all scoped org units once, then all instances for all datasets,
+     * and groups by dataset ID.
+     */
+    override suspend fun getDatasetInstanceCounts(datasetIds: List<String>): Map<String, Int> {
+        if (datasetIds.isEmpty()) return emptyMap()
+
+        return withContext(Dispatchers.IO) {
+            try {
+                val d2Instance = d2Provider.awaitD2()
+                Log.d(TAG, "Getting batch instance counts for ${datasetIds.size} datasets")
+
+                // Use cached scoped org units
+                val scopedOrgUnits = orgUnitCache.getScopedOrgUnits()
+
+                if (scopedOrgUnits.isEmpty()) {
+                    Log.e(TAG, "No organization units found in data capture scope")
+                    return@withContext emptyMap()
+                }
+
+                val scopedIds = scopedOrgUnits.map { it.uid() }.toSet()
+
+                // Get all instances for all datasets in ONE query
+                val allInstances = d2Instance.dataSetModule().dataSetInstances()
+                    .byDataSetUid().`in`(datasetIds)
+                    .byOrganisationUnitUid().`in`(scopedIds.toList())
+                    .get().await()
+
+                // Group by dataset ID and count
+                val counts = allInstances
+                    .groupBy { it.dataSetUid() }
+                    .mapValues { it.value.size }
+
+                Log.d(TAG, "Batch count complete: ${counts.size} datasets have instances, total ${allInstances.size} instances")
+                counts
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to get batch instance counts", e)
+                emptyMap()
+            }
+        }
+    }
+
     override suspend fun markDatasetInstanceIncomplete(datasetId: String, period: String, orgUnit: String, attributeOptionCombo: String): Result<Unit> {
         return withContext(Dispatchers.IO) {
             try {
+                val d2Instance = d2Provider.awaitD2()
                 Log.d(TAG, "Marking dataset as incomplete: $datasetId, $period, $orgUnit, $attributeOptionCombo")
-                d2.dataSetModule().dataSetCompleteRegistrations()
+                // These are mutation operations - use blocking versions (run on IO dispatcher)
+                d2Instance.dataSetModule().dataSetCompleteRegistrations()
                     .value(period, orgUnit, datasetId, attributeOptionCombo).blockingDeleteIfExist()
-                d2.dataSetModule().dataSetCompleteRegistrations().blockingUpload()
+                d2Instance.dataSetModule().dataSetCompleteRegistrations().blockingUpload()
                 Log.d(TAG, "Dataset marked as incomplete successfully.")
                 Result.success(Unit)
             } catch (e: Exception) {
@@ -279,11 +331,12 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
      */
     private suspend fun syncTrackerData(programId: String) = withContext(Dispatchers.IO) {
         Log.d(TAG, "=== TRACKER DATA SYNC START for program: $programId ===")
+        val d2Instance = d2Provider.awaitD2()
 
         try {
-            // Validate authentication state
+            // Validate authentication state (quick check, blocking is fine on IO)
             val isLoggedIn = try {
-                d2.userModule().isLogged().blockingGet()
+                d2Instance.userModule().isLogged().blockingGet()
             } catch (e: Exception) {
                 false
             }
@@ -293,7 +346,7 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
                 throw Exception("Cannot sync tracker data in offline mode. Please login online first.")
             }
 
-            val user = d2.userModule().user().blockingGet()
+            val user = d2Instance.userModule().user().blockingGet()
             if (user?.uid() == null) {
                 Log.e(TAG, "Invalid authentication state - user UID is null")
                 throw Exception("Invalid authentication state")
@@ -305,7 +358,7 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
             Log.d(TAG, "STEP 1: Ensuring tracker metadata is complete...")
             try {
                 // Download complete metadata with special focus on tracker dependencies
-                d2.metadataModule().blockingDownload()
+                d2Instance.metadataModule().blockingDownload()
                 Log.d(TAG, "Metadata sync completed")
             } catch (e: Exception) {
                 Log.e(TAG, "Metadata sync failed: ${e.message}", e)
@@ -317,7 +370,7 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
             // sessionManager.checkForeignKeyViolations() - Removed as part of simplification
 
             // STEP 3: Get user's org unit scope for tracker data
-            val userOrgUnits = d2.organisationUnitModule().organisationUnits()
+            val userOrgUnits = d2Instance.organisationUnitModule().organisationUnits()
                 .byOrganisationUnitScope(OrganisationUnit.Scope.SCOPE_DATA_CAPTURE)
                 .get().await()
 
@@ -335,7 +388,7 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
             Log.d(TAG, "STEP 4: Downloading tracker data for program $programId...")
 
             // Use TrackedEntityInstanceDownloader with specific program filter
-            val downloader = d2.trackedEntityModule().trackedEntityInstanceDownloader()
+            val downloader = d2Instance.trackedEntityModule().trackedEntityInstanceDownloader()
                 .byProgramUid(programId)
 
             // Execute download
@@ -351,17 +404,17 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
             // STEP 6: Verify what was actually stored
             Log.d(TAG, "STEP 6: Verifying stored tracker data...")
 
-            val storedTEIs = d2.trackedEntityModule().trackedEntityInstances()
+            val storedTEIs = d2Instance.trackedEntityModule().trackedEntityInstances()
                 .byProgramUids(listOf(programId))
                 .get().await()
             Log.d(TAG, "Found ${storedTEIs.size} TrackedEntityInstances in local storage")
 
-            val storedEnrollments = d2.enrollmentModule().enrollments()
+            val storedEnrollments = d2Instance.enrollmentModule().enrollments()
                 .byProgram().eq(programId)
                 .get().await()
             Log.d(TAG, "Found ${storedEnrollments.size} Enrollments in local storage")
 
-            val storedEvents = d2.eventModule().events()
+            val storedEvents = d2Instance.eventModule().events()
                 .byProgramUid().eq(programId)
                 .get().await()
             Log.d(TAG, "Found ${storedEvents.size} Events in local storage")
@@ -371,16 +424,16 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
                 Log.w(TAG, "DIAGNOSTIC: No tracker data stored despite successful download")
 
                 // Check if program exists and is accessible
-                val program = d2.programModule().programs().uid(programId).get().await()
+                val program = d2Instance.programModule().programs().uid(programId).get().await()
                 Log.d(TAG, "DIAGNOSTIC: Program details - UID: ${program?.uid()}, Name: ${program?.displayName()}, Type: ${program?.programType()}")
 
                 // Check if there are any TEIs at all for any program in accessible org units
-                val anyTEIs = d2.trackedEntityModule().trackedEntityInstances()
-                    .blockingCount()
-                Log.d(TAG, "DIAGNOSTIC: Total TEIs in database: $anyTEIs")
+                val allTEIs = d2Instance.trackedEntityModule().trackedEntityInstances()
+                    .get().await()
+                Log.d(TAG, "DIAGNOSTIC: Total TEIs in database: ${allTEIs.size}")
 
                 // Check if the issue is org unit scope mismatch
-                val allOrgUnitsWithTEIs = d2.trackedEntityModule().trackedEntityInstances()
+                val allOrgUnitsWithTEIs = d2Instance.trackedEntityModule().trackedEntityInstances()
                     .get().await()
                     .map { it.organisationUnit() }
                     .distinct()
@@ -465,14 +518,15 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
             com.ash.simpledataentry.domain.model.ProgramType.TRACKER -> {
                 withContext(Dispatchers.IO) {
                     try {
-                        val scopedOrgUnits = d2.organisationUnitModule().organisationUnits()
+                        val d2Instance = d2Provider.awaitD2()
+                        val scopedOrgUnits = d2Instance.organisationUnitModule().organisationUnits()
                             .byOrganisationUnitScope(OrganisationUnit.Scope.SCOPE_DATA_CAPTURE)
                             .get().await()
                         if (scopedOrgUnits.isEmpty()) {
                             return@withContext 0
                         }
 
-                        val attachedOrgUnits = d2.organisationUnitModule().organisationUnits()
+                        val attachedOrgUnits = d2Instance.organisationUnitModule().organisationUnits()
                             .byProgramUids(listOf(programId))
                             .get().await()
 
@@ -480,10 +534,11 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
                         val attachedIds = attachedOrgUnits.map { it.uid() }.toSet()
                         val relevantOrgUnitIds = scopedIds.intersect(attachedIds).ifEmpty { scopedIds }
 
-                        d2.trackedEntityModule().trackedEntityInstances()
+                        val instances = d2Instance.trackedEntityModule().trackedEntityInstances()
                             .byProgramUids(listOf(programId))
                             .byOrganisationUnitUid().`in`(relevantOrgUnitIds.toList())
-                            .blockingCount()
+                            .get().await()
+                        instances.size
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to get tracker enrollment count for program $programId", e)
                         0
@@ -493,14 +548,15 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
             com.ash.simpledataentry.domain.model.ProgramType.EVENT -> {
                 withContext(Dispatchers.IO) {
                     try {
-                        val scopedOrgUnits = d2.organisationUnitModule().organisationUnits()
+                        val d2Instance = d2Provider.awaitD2()
+                        val scopedOrgUnits = d2Instance.organisationUnitModule().organisationUnits()
                             .byOrganisationUnitScope(OrganisationUnit.Scope.SCOPE_DATA_CAPTURE)
                             .get().await()
                         if (scopedOrgUnits.isEmpty()) {
                             return@withContext 0
                         }
 
-                        val attachedOrgUnits = d2.organisationUnitModule().organisationUnits()
+                        val attachedOrgUnits = d2Instance.organisationUnitModule().organisationUnits()
                             .byProgramUids(listOf(programId))
                             .get().await()
 
@@ -508,10 +564,11 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
                         val attachedIds = attachedOrgUnits.map { it.uid() }.toSet()
                         val relevantOrgUnitIds = scopedIds.intersect(attachedIds).ifEmpty { scopedIds }
 
-                        d2.eventModule().events()
+                        val events = d2Instance.eventModule().events()
                             .byProgramUid().eq(programId)
                             .byOrganisationUnitUid().`in`(relevantOrgUnitIds.toList())
-                            .blockingCount()
+                            .get().await()
+                        events.size
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to get event count for program $programId", e)
                         0
@@ -528,6 +585,7 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
     ): Result<Unit> {
         return withContext(Dispatchers.IO) {
             try {
+                val d2Instance = d2Provider.awaitD2()
                 when (programType) {
                     com.ash.simpledataentry.domain.model.ProgramType.DATASET -> {
                         syncDatasetInstances()
@@ -539,18 +597,18 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
                         // Sync events - download from server
                         Log.d(TAG, "=== EVENT DATA SYNC START for program: $programId ===")
 
-                        // First ensure metadata is up to date
-                        d2.metadataModule().blockingDownload()
+                        // First ensure metadata is up to date (mutation, blocking is fine on IO)
+                        d2Instance.metadataModule().blockingDownload()
                         Log.d(TAG, "EVENT SYNC: Metadata sync completed")
 
                         // Then download actual event data for this specific program
                         Log.d(TAG, "EVENT SYNC: Starting event download...")
-                        d2.eventModule().eventDownloader()
+                        d2Instance.eventModule().eventDownloader()
                             .byProgramUid(programId)
                             .blockingDownload()
 
                         // Verify what was actually stored
-                        val storedEvents = d2.eventModule().events()
+                        val storedEvents = d2Instance.eventModule().events()
                             .byProgramUid().eq(programId)
                             .get().await()
                         Log.d(TAG, "EVENT SYNC: Found ${storedEvents.size} events in local storage for program $programId")
@@ -580,13 +638,17 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
     override suspend fun getTrackerEnrollments(programId: String): kotlinx.coroutines.flow.Flow<List<com.ash.simpledataentry.domain.model.ProgramInstance.TrackerEnrollment>> =
         trackerEnrollmentDao.getByProgram(programId).map { entities ->
             withContext(Dispatchers.IO) {
+                val d2Instance = d2 ?: run {
+                    Log.w(TAG, "D2 session not available for getTrackerEnrollments")
+                    return@withContext emptyList()
+                }
                 // PHASE 2 FIX: Read from Room cache (populated by sync)
                 // Fetch program name once (metadata, not data-intensive)
-                val program = d2.programModule().programs()
+                val program = d2Instance.programModule().programs()
                     .uid(programId)
                     .get().await()
                 val programName = program?.displayName() ?: program?.name() ?: "Unknown Program"
-                val stageNameById = d2.programModule().programStages()
+                val stageNameById = d2Instance.programModule().programStages()
                     .byProgramUid().eq(programId)
                     .get().await()
                     .associate { stage ->
@@ -617,7 +679,7 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
                                     )
                                 }
                             } else {
-                                d2.eventModule().events()
+                                d2Instance.eventModule().events()
                                     .byEnrollmentUid().eq(entity.id)
                                     .get().await()
                                     .map { event ->
@@ -647,11 +709,11 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
                     val teiUid = entity.trackedEntityInstanceId
                     val attributeValues = if (teiUid.isNotEmpty()) {
                         try {
-                            d2.trackedEntityModule().trackedEntityAttributeValues()
+                            d2Instance.trackedEntityModule().trackedEntityAttributeValues()
                                 .byTrackedEntityInstance().eq(teiUid)
                                 .get().await()
                                 .mapNotNull { attrValue ->
-                                    val attribute = d2.trackedEntityModule().trackedEntityAttributes()
+                                    val attribute = d2Instance.trackedEntityModule().trackedEntityAttributes()
                                         .uid(attrValue.trackedEntityAttribute())
                                         .get().await()
 
@@ -728,8 +790,12 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
         orgUnitId: String
     ): Result<String> {
         return withContext(Dispatchers.IO) {
+            val d2Instance = d2 ?: run {
+                Log.w(TAG, "D2 session not available for createTrackerEnrollment")
+                return@withContext Result.failure(Exception("D2 session not available"))
+            }
             try {
-                val enrollmentUid = d2.enrollmentModule().enrollments()
+                val enrollmentUid = d2Instance.enrollmentModule().enrollments()
                     .blockingAdd(
                         org.hisp.dhis.android.core.enrollment.EnrollmentCreateProjection.builder()
                             .program(programId)
@@ -747,8 +813,12 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
 
     override suspend fun completeEnrollment(enrollmentId: String): Result<Unit> {
         return withContext(Dispatchers.IO) {
+            val d2Instance = d2 ?: run {
+                Log.w(TAG, "D2 session not available for completeEnrollment")
+                return@withContext Result.failure(Exception("D2 session not available"))
+            }
             try {
-                d2.enrollmentModule().enrollments().uid(enrollmentId)
+                d2Instance.enrollmentModule().enrollments().uid(enrollmentId)
                     .setStatus(org.hisp.dhis.android.core.enrollment.EnrollmentStatus.COMPLETED)
                 Result.success(Unit)
             } catch (e: Exception) {
@@ -760,8 +830,12 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
 
     override suspend fun cancelEnrollment(enrollmentId: String): Result<Unit> {
         return withContext(Dispatchers.IO) {
+            val d2Instance = d2 ?: run {
+                Log.w(TAG, "D2 session not available for cancelEnrollment")
+                return@withContext Result.failure(Exception("D2 session not available"))
+            }
             try {
-                d2.enrollmentModule().enrollments().uid(enrollmentId)
+                d2Instance.enrollmentModule().enrollments().uid(enrollmentId)
                     .setStatus(org.hisp.dhis.android.core.enrollment.EnrollmentStatus.CANCELLED)
                 Result.success(Unit)
             } catch (e: Exception) {
@@ -774,11 +848,16 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
     // Event-specific methods
     override suspend fun getEventInstances(programId: String): kotlinx.coroutines.flow.Flow<List<com.ash.simpledataentry.domain.model.ProgramInstance.EventInstance>> =
         kotlinx.coroutines.flow.flow {
+            val d2Instance = d2 ?: run {
+                Log.w(TAG, "D2 session not available for getEventInstances")
+                emit(emptyList())
+                return@flow
+            }
             try {
                 Log.d(TAG, "Fetching event instances for program: $programId")
 
                 // Get user's data capture org units AND their descendants (children)
-                val userOrgUnits = d2.organisationUnitModule().organisationUnits()
+                val userOrgUnits = d2Instance.organisationUnitModule().organisationUnits()
                     .byOrganisationUnitScope(OrganisationUnit.Scope.SCOPE_DATA_CAPTURE)
                     .get().await()
 
@@ -797,7 +876,7 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
                     allAccessibleOrgUnits.add(userOrgUnit.uid())
 
                     // Add all descendants using the path-based approach
-                    val descendants = d2.organisationUnitModule().organisationUnits()
+                    val descendants = d2Instance.organisationUnitModule().organisationUnits()
                         .byPath().like("${userOrgUnit.path()}/%")
                         .get().await()
 
@@ -811,7 +890,7 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
                 // Get events using the expanded org unit list
                 // NOTE: Cannot add .limit() here - DHIS2 SDK event queries don't support it
                 // Full fix in Phase 2: Convert to Room DAOs with proper pagination
-                val events = d2.eventModule().events()
+                val events = d2Instance.eventModule().events()
                     .byProgramUid().eq(programId)
                     .byOrganisationUnitUid().`in`(allAccessibleOrgUnits.toList())
                     .byStatus().`in`(listOf(
@@ -827,11 +906,11 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
                 Log.d(TAG, "Found ${events.size} events for program $programId (filtered by ${allAccessibleOrgUnits.size} org units including children, valid statuses, not deleted)")
 
                 val programInstances = events.map { event ->
-                    val orgUnit = d2.organisationUnitModule().organisationUnits()
+                    val orgUnit = d2Instance.organisationUnitModule().organisationUnits()
                         .uid(event.organisationUnit())
                         .get().await()
 
-                    val program = d2.programModule().programs()
+                    val program = d2Instance.programModule().programs()
                         .uid(programId)
                         .get().await()
 
@@ -886,8 +965,12 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
         orgUnitId: String
     ): Result<String> {
         return withContext(Dispatchers.IO) {
+            val d2Instance = d2 ?: run {
+                Log.w(TAG, "D2 session not available for createEventInstance")
+                return@withContext Result.failure(Exception("D2 session not available"))
+            }
             try {
-                val eventUid = d2.eventModule().events()
+                val eventUid = d2Instance.eventModule().events()
                     .blockingAdd(
                         org.hisp.dhis.android.core.event.EventCreateProjection.builder()
                             .program(programId)
@@ -905,8 +988,12 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
 
     override suspend fun completeEvent(eventId: String): Result<Unit> {
         return withContext(Dispatchers.IO) {
+            val d2Instance = d2 ?: run {
+                Log.w(TAG, "D2 session not available for completeEvent")
+                return@withContext Result.failure(Exception("D2 session not available"))
+            }
             try {
-                d2.eventModule().events().uid(eventId)
+                d2Instance.eventModule().events().uid(eventId)
                     .setStatus(org.hisp.dhis.android.core.event.EventStatus.COMPLETED)
                 Result.success(Unit)
             } catch (e: Exception) {
@@ -918,8 +1005,12 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
 
     override suspend fun skipEvent(eventId: String): Result<Unit> {
         return withContext(Dispatchers.IO) {
+            val d2Instance = d2 ?: run {
+                Log.w(TAG, "D2 session not available for skipEvent")
+                return@withContext Result.failure(Exception("D2 session not available"))
+            }
             try {
-                d2.eventModule().events().uid(eventId)
+                d2Instance.eventModule().events().uid(eventId)
                     .setStatus(org.hisp.dhis.android.core.event.EventStatus.SKIPPED)
                 Result.success(Unit)
             } catch (e: Exception) {
@@ -931,11 +1022,15 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
 
     // PHASE 2 HELPER: Populate Room cache from SDK data after sync
     private suspend fun populateTrackerEnrollmentsCache(programId: String) = withContext(Dispatchers.IO) {
+        val d2Instance = d2 ?: run {
+            Log.w(TAG, "D2 session not available for populateTrackerEnrollmentsCache")
+            return@withContext
+        }
         try {
             Log.d(TAG, "Populating Room cache for tracker enrollments (program: $programId)")
 
             // Fetch enrollments from SDK (already downloaded by sync)
-            val sdkEnrollments = d2.enrollmentModule().enrollments()
+            val sdkEnrollments = d2Instance.enrollmentModule().enrollments()
                 .byProgram().eq(programId)
                 .byDeleted().eq(false)
                 .get().await()
@@ -944,7 +1039,7 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
 
             // Convert to Room entities
             val entities = sdkEnrollments.map { enrollment ->
-                val orgUnit = d2.organisationUnitModule().organisationUnits()
+                val orgUnit = d2Instance.organisationUnitModule().organisationUnits()
                     .uid(enrollment.organisationUnit())
                     .get().await()
 
@@ -975,11 +1070,15 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
     }
 
     private suspend fun populateEventInstancesCache(programId: String) = withContext(Dispatchers.IO) {
+        val d2Instance = d2 ?: run {
+            Log.w(TAG, "D2 session not available for populateEventInstancesCache")
+            return@withContext
+        }
         try {
             Log.d(TAG, "Populating Room cache for event instances (program: $programId)")
 
             // Fetch events from SDK (already downloaded by sync)
-            val sdkEvents = d2.eventModule().events()
+            val sdkEvents = d2Instance.eventModule().events()
                 .byProgramUid().eq(programId)
                 .byDeleted().eq(false)
                 .get().await()
@@ -988,7 +1087,7 @@ class DatasetInstancesRepositoryImpl @Inject constructor(
 
             // Convert to Room entities
             val entities = sdkEvents.map { event ->
-                val orgUnit = d2.organisationUnitModule().organisationUnits()
+                val orgUnit = d2Instance.organisationUnitModule().organisationUnits()
                     .uid(event.organisationUnit())
                     .get().await()
 

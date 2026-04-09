@@ -11,6 +11,20 @@ import kotlinx.coroutines.launch
 import com.ash.simpledataentry.domain.model.Option
 import com.ash.simpledataentry.domain.model.OptionSet
 import com.ash.simpledataentry.domain.model.DataValue
+import org.hisp.dhis.mobile.ui.designsystem.component.Button
+import org.hisp.dhis.mobile.ui.designsystem.component.ButtonStyle
+import org.hisp.dhis.mobile.ui.designsystem.component.ColorStyle
+
+private fun resolveSelectedOption(optionSet: OptionSet, selectedValue: String?): Option? {
+    if (selectedValue.isNullOrBlank()) return null
+    val normalized = selectedValue.trim().lowercase()
+    return optionSet.options.firstOrNull { option ->
+        val code = option.code.lowercase()
+        val name = option.name.lowercase()
+        val display = option.displayName?.lowercase()
+        normalized == code || normalized == name || (display != null && normalized == display)
+    }
+}
 
 /**
  * Simple dropdown component for option sets with >4 options
@@ -28,7 +42,7 @@ fun OptionSetDropdown(
     modifier: Modifier = Modifier
 ) {
     val sortedOptions = optionSet.options.sortedBy { it.sortOrder }
-    val selectedOption = selectedCode?.let { code -> sortedOptions.firstOrNull { it.code == code } }
+    val selectedOption = resolveSelectedOption(optionSet, selectedCode)
 
     var expanded by remember { mutableStateOf(false) }
 
@@ -81,6 +95,7 @@ fun OptionSetRadioGroup(
     modifier: Modifier = Modifier
 ) {
     val sortedOptions = optionSet.options.sortedBy { it.sortOrder }
+    val selectedOption = resolveSelectedOption(optionSet, selectedCode)
 
     Column(modifier = modifier) {
         Text(
@@ -96,7 +111,7 @@ fun OptionSetRadioGroup(
                     .padding(vertical = 4.dp)
             ) {
                 RadioButton(
-                    selected = option.code == selectedCode,
+                    selected = option == selectedOption,
                     onClick = { if (enabled) onOptionSelected(option.code) },
                     enabled = enabled
                 )
@@ -112,8 +127,60 @@ fun OptionSetRadioGroup(
 }
 
 /**
+ * Button pair for yes/no option sets
+ */
+@Composable
+fun OptionSetYesNoButtons(
+    optionSet: OptionSet,
+    selectedCode: String?,
+    title: String,
+    isRequired: Boolean = false,
+    enabled: Boolean = true,
+    onOptionSelected: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val sortedOptions = optionSet.options.sortedBy { it.sortOrder }
+    val yesOption = sortedOptions.getOrNull(0)
+    val noOption = sortedOptions.getOrNull(1)
+    val selectedOption = resolveSelectedOption(optionSet, selectedCode)
+
+    Column(modifier = modifier) {
+        Text(
+            text = if (isRequired) "$title *" else title,
+            style = MaterialTheme.typography.bodyMedium
+        )
+        Spacer(modifier = Modifier.height(6.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Button(
+                text = yesOption?.let { it.displayName ?: it.name } ?: "Yes",
+                style = if (yesOption != null && yesOption == selectedOption) ButtonStyle.FILLED else ButtonStyle.OUTLINED,
+                colorStyle = ColorStyle.DEFAULT,
+                modifier = Modifier.weight(1f),
+                enabled = enabled && yesOption != null,
+                onClick = {
+                    yesOption?.let { onOptionSelected(it.code) }
+                }
+            )
+            Button(
+                text = noOption?.let { it.displayName ?: it.name } ?: "No",
+                style = if (noOption != null && noOption == selectedOption) ButtonStyle.FILLED else ButtonStyle.OUTLINED,
+                colorStyle = ColorStyle.DEFAULT,
+                modifier = Modifier.weight(1f),
+                enabled = enabled && noOption != null,
+                onClick = {
+                    noOption?.let { onOptionSelected(it.code) }
+                }
+            )
+        }
+    }
+}
+
+/**
  * Simple checkbox for boolean YES/NO options
- * Checked = "1" (Yes), Unchecked = "0" (No)
+ * Checked = "true" (Yes), Unchecked = "false" (No)
  */
 @Composable
 fun YesNoCheckbox(
@@ -124,7 +191,7 @@ fun YesNoCheckbox(
     onValueChanged: (String?) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    // Determine if checked (Yes = "1", "true", "yes")
+    // Determine if checked (Yes = "true"/"1"/"yes")
     val isChecked = selectedValue?.lowercase() in listOf("yes", "true", "1")
 
     // Use remember to track local state for immediate UI feedback
@@ -147,7 +214,7 @@ fun YesNoCheckbox(
                 if (enabled) {
                     // Update local state immediately for visual feedback
                     localChecked = checked
-                    val newValue = if (checked) "1" else "0"
+                    val newValue = if (checked) "true" else "false"
                     android.util.Log.d("YesNoCheckbox", "Checkbox ${if (checked) "checked" else "unchecked"} for $title, value=$newValue")
                     onValueChanged(newValue)
                 } else {

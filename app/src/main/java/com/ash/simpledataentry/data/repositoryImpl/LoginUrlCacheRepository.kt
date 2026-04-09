@@ -12,7 +12,7 @@ import javax.inject.Singleton
 class LoginUrlCacheRepository @Inject constructor(
     private val databaseProvider: DatabaseProvider
 ) {
-    private val cachedUrlDao get() = databaseProvider.getCurrentDatabase().cachedUrlDao()
+    private val cachedUrlDao get() = databaseProvider.getSharedDatabase().cachedUrlDao()
     
     // URL validation pattern for DHIS2 server URLs
     private val urlPattern = Pattern.compile(

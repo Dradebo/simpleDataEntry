@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.room.Room
 import com.ash.simpledataentry.data.SessionManager
 import com.ash.simpledataentry.data.DatabaseProvider
+import com.ash.simpledataentry.data.D2Provider
 import com.ash.simpledataentry.data.repositoryImpl.AuthRepositoryImpl
 import com.ash.simpledataentry.data.repositoryImpl.DataEntryRepositoryImpl
 import com.ash.simpledataentry.data.repositoryImpl.DatasetInstancesRepositoryImpl
@@ -53,6 +54,7 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 import com.ash.simpledataentry.data.local.DataValueDao
 import com.ash.simpledataentry.data.cache.MetadataCacheService
+import com.ash.simpledataentry.data.cache.OrgUnitCacheService
 import com.ash.simpledataentry.data.sync.BackgroundDataPrefetcher
 import com.ash.simpledataentry.data.sync.NetworkStateManager
 import com.ash.simpledataentry.data.sync.SyncQueueManager
@@ -222,9 +224,10 @@ object AppModule {
         sessionManager: SessionManager,
         databaseProvider: DatabaseProvider,
         @ApplicationContext context: Context,
-        datasetInstancesRepository: DatasetInstancesRepository
+        datasetInstancesRepository: DatasetInstancesRepository,
+        d2Provider: D2Provider
     ): DatasetsRepository {
-        return DatasetsRepositoryImpl(sessionManager, databaseProvider, context, datasetInstancesRepository)
+        return DatasetsRepositoryImpl(sessionManager, databaseProvider, context, datasetInstancesRepository, d2Provider)
     }
 
     /**
@@ -253,9 +256,11 @@ object AppModule {
     @Singleton
     fun provideDatasetInstancesRepository(
         sessionManager: SessionManager,
-        databaseProvider: DatabaseProvider
+        databaseProvider: DatabaseProvider,
+        d2Provider: D2Provider,
+        orgUnitCache: OrgUnitCacheService
     ): DatasetInstancesRepository {
-        return DatasetInstancesRepositoryImpl(sessionManager, databaseProvider)
+        return DatasetInstancesRepositoryImpl(sessionManager, databaseProvider, d2Provider, orgUnitCache)
     }
 
 
@@ -282,11 +287,13 @@ object AppModule {
     @Singleton
     fun provideMetadataCacheService(
         sessionManager: SessionManager,
-        databaseProvider: DatabaseProvider
+        databaseProvider: DatabaseProvider,
+        d2Provider: D2Provider
     ): MetadataCacheService {
         return MetadataCacheService(
             sessionManager,
-            databaseProvider
+            databaseProvider,
+            d2Provider
         )
     }
 
@@ -318,9 +325,10 @@ object AppModule {
         networkStateManager: NetworkStateManager,
         sessionManager: SessionManager,
         databaseProvider: DatabaseProvider,
-        @ApplicationContext context: Context
+        @ApplicationContext context: Context,
+        d2Provider: D2Provider
     ): SyncQueueManager {
-        return SyncQueueManager(networkStateManager, sessionManager, databaseProvider, context)
+        return SyncQueueManager(networkStateManager, sessionManager, databaseProvider, context, d2Provider)
     }
 
     @Provides
@@ -339,6 +347,8 @@ object AppModule {
         metadataCacheService: MetadataCacheService,
         networkStateManager: NetworkStateManager,
         syncQueueManager: SyncQueueManager,
+        d2Provider: D2Provider,
+        orgUnitCache: OrgUnitCacheService,
         @ApplicationContext context: Context
     ): DataEntryRepository {
         return DataEntryRepositoryImpl(
@@ -347,7 +357,9 @@ object AppModule {
             context,
             metadataCacheService,
             networkStateManager,
-            syncQueueManager
+            syncQueueManager,
+            d2Provider,
+            orgUnitCache
         )
     }
 

@@ -36,6 +36,7 @@ interface DataEntryRepository {
     suspend fun getUserOrgUnits(datasetId: String): List<OrganisationUnit>
     suspend fun getScopedOrgUnits(): List<OrganisationUnit>
     suspend fun getOrgUnitsAttachedToDataSets(datasetIds: List<String>): Set<String>
+    suspend fun isDatasetAttachedToScopedOrgUnits(datasetId: String): Boolean
     suspend fun expandOrgUnitSelection(targetId: String, orgUnitId: String): Set<String>
     suspend fun getDefaultAttributeOptionCombo(): String
     suspend fun getAttributeOptionCombos(datasetId: String): List<Pair<String, String>>

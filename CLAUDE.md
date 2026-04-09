@@ -117,6 +117,11 @@ From `AppNavigation.kt`:
 6. ✅ **Use Beads for ALL issue tracking and documentation** - NO new markdown files in project
 7. ✅ Check Beads issues for current status and context before starting work
 
+### Blackbox (Do Not Touch Without Profiling)
+1. 🔒 **Category parsing for EditEntryScreen**: must be derived from metadata form structure, not data values.
+   - Location: `app/src/main/java/com/ash/simpledataentry/presentation/dataEntry/DataEntryViewModel.kt`
+   - Reason: changes here have repeatedly caused ANRs and category mapping regressions.
+
 ## Recent Session Work (2025-12-17)
 
 ### COMPLETED - Nested Accordion Data Entry System ✅

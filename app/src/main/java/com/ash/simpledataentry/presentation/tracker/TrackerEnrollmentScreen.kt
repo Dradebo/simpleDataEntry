@@ -271,6 +271,8 @@ fun TrackerEnrollmentScreen(
                                                 },
                                                 onPreviousSubsection = {},
                                                 onNextSubsection = {},
+                                                canPreviousSubsection = false,
+                                                canNextSubsection = false,
                                                 hasSubsections = false
                                             )
                                         }

@@ -176,11 +176,31 @@ class DatasetsViewModel @Inject constructor(
                     val currentFilter = currentData.currentFilter
                     val currentProgramType = currentData.currentProgramType
 
+                    val filteredProgramsByOrgUnit = withContext(Dispatchers.IO) {
+                        val allowedDatasetIds = programs
+                            .filterIsInstance<ProgramItem.DatasetProgram>()
+                            .mapNotNull { program ->
+                                if (dataEntryRepository.isDatasetAttachedToScopedOrgUnits(program.dataset.id)) {
+                                    program.dataset.id
+                                } else {
+                                    null
+                                }
+                            }
+                            .toSet()
+
+                        programs.filter { program ->
+                            when (program) {
+                                is ProgramItem.DatasetProgram -> program.dataset.id in allowedDatasetIds
+                                else -> true
+                            }
+                        }
+                    }
+
                     // Filter programs if needed
-                    val filteredPrograms = filterPrograms(programs, currentFilter, currentProgramType)
+                    val filteredPrograms = filterPrograms(filteredProgramsByOrgUnit, currentFilter, currentProgramType)
 
                     val newData = DatasetsData(
-                        programs = programs,
+                        programs = filteredProgramsByOrgUnit,
                         filteredPrograms = filteredPrograms,
                         currentFilter = currentFilter,
                         currentProgramType = currentProgramType,

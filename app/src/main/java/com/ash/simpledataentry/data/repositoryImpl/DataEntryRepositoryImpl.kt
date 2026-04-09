@@ -9,12 +9,14 @@ import dagger.hilt.android.scopes.ViewModelScoped
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import com.ash.simpledataentry.data.DatabaseProvider
+import com.ash.simpledataentry.data.D2Provider
 import com.ash.simpledataentry.data.SessionManager
 import org.hisp.dhis.android.core.D2
 import com.ash.simpledataentry.data.local.DataValueDraftDao
 import com.ash.simpledataentry.data.local.DataValueDraftEntity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.rx2.await
 import com.ash.simpledataentry.data.local.DataElementDao
 import com.ash.simpledataentry.data.local.CategoryComboDao
 import com.ash.simpledataentry.data.local.CategoryOptionComboDao
@@ -23,6 +25,7 @@ import com.ash.simpledataentry.util.NetworkUtils
 import com.ash.simpledataentry.data.local.DataValueEntity
 import com.ash.simpledataentry.data.local.DataValueDao
 import com.ash.simpledataentry.data.cache.MetadataCacheService
+import com.ash.simpledataentry.data.cache.OrgUnitCacheService
 import com.ash.simpledataentry.data.sync.NetworkStateManager
 import com.ash.simpledataentry.data.sync.SyncQueueManager
 import javax.inject.Inject
@@ -43,7 +46,9 @@ class DataEntryRepositoryImpl @Inject constructor(
     private val context: android.content.Context,
     private val metadataCacheService: MetadataCacheService,
     private val networkStateManager: NetworkStateManager,
-    private val syncQueueManager: SyncQueueManager
+    private val syncQueueManager: SyncQueueManager,
+    private val d2Provider: D2Provider,
+    private val orgUnitCache: OrgUnitCacheService
 ) : DataEntryRepository {
 
     // Dynamic DAO accessors - always get from current database
@@ -54,7 +59,11 @@ class DataEntryRepositoryImpl @Inject constructor(
     private val organisationUnitDao: OrganisationUnitDao get() = databaseProvider.getCurrentDatabase().organisationUnitDao()
     private val dataValueDao: DataValueDao get() = databaseProvider.getCurrentDatabase().dataValueDao()
 
-    private val d2 get() = sessionManager.getD2()!!
+    /**
+     * Use d2Provider.awaitD2() in suspend functions for safe, non-racing access.
+     * This property is kept for backward compatibility but prefer awaitD2().
+     */
+    private val d2: D2? get() = d2Provider.getD2OrNull()
 
     // Track current period offset per dataset for incremental "Show more" loading
     private val periodOffsets = mutableMapOf<String, Int>()
@@ -70,7 +79,11 @@ class DataEntryRepositoryImpl @Inject constructor(
             ValueType.INTEGER_ZERO_OR_POSITIVE -> DataEntryType.POSITIVE_INTEGER
             ValueType.PERCENTAGE -> DataEntryType.PERCENTAGE
             ValueType.DATE -> DataEntryType.DATE
+            ValueType.DATETIME -> DataEntryType.DATETIME
+            ValueType.TIME -> DataEntryType.TIME
             ValueType.BOOLEAN -> DataEntryType.YES_NO
+            ValueType.TRUE_ONLY -> DataEntryType.TRUE_ONLY
+            ValueType.PHONE_NUMBER -> DataEntryType.PHONE_NUMBER
             ValueType.COORDINATE -> DataEntryType.COORDINATES
             //ValueType.OPTION_SET -> DataEntryType.MULTIPLE_CHOICE
             else -> DataEntryType.TEXT
@@ -121,7 +134,11 @@ class DataEntryRepositoryImpl @Inject constructor(
             "INTEGER_ZERO_OR_POSITIVE" -> DataEntryType.POSITIVE_INTEGER
             "PERCENTAGE" -> DataEntryType.PERCENTAGE
             "DATE" -> DataEntryType.DATE
+            "DATETIME" -> DataEntryType.DATETIME
+            "TIME" -> DataEntryType.TIME
             "BOOLEAN" -> DataEntryType.YES_NO
+            "TRUE_ONLY" -> DataEntryType.TRUE_ONLY
+            "PHONE_NUMBER" -> DataEntryType.PHONE_NUMBER
             "COORDINATE" -> DataEntryType.COORDINATES
             else -> DataEntryType.TEXT
         }
@@ -297,8 +314,9 @@ class DataEntryRepositoryImpl @Inject constructor(
         value: String?,
         comment: String?
     ): Result<DataValue> {
+        val d2Instance = d2 ?: return Result.failure(Exception("D2 session not available"))
         return try {
-            val dataValueObjectRepository = d2.dataValueModule().dataValues()
+            val dataValueObjectRepository = d2Instance.dataValueModule().dataValues()
                 .value(period, orgUnit, dataElement, categoryOptionCombo, attributeOptionCombo)
 
             if (value != null) {
@@ -334,11 +352,11 @@ class DataEntryRepositoryImpl @Inject constructor(
                 Log.d("DataEntryRepositoryImpl", "Deleted value and removed from draft queue")
             }
 
-            val dataElementObj = d2.dataElementModule().dataElements()
+            val dataElementObj = d2Instance.dataElementModule().dataElements()
                 .uid(dataElement)
                 .blockingGet() ?: throw Exception("Data element not found")
 
-            val dataSet = d2.dataSetModule().dataSets()
+            val dataSet = d2Instance.dataSetModule().dataSets()
                 .withDataSetElements()
                 .uid(datasetId)
                 .blockingGet() ?: throw Exception("Dataset not found")
@@ -349,7 +367,7 @@ class DataEntryRepositoryImpl @Inject constructor(
                 ?: dataElementObj.displayName()
                 ?: dataElement
 
-            val sectionName = d2.dataSetModule().sections()
+            val sectionName = d2Instance.dataSetModule().sections()
                 .byDataSetUid().eq(datasetId)
                 .blockingGet()
                 .find { section ->
@@ -358,7 +376,7 @@ class DataEntryRepositoryImpl @Inject constructor(
                 ?.displayName() ?: "Default Section"
 
             val categoryOptionComboName = if (categoryOptionCombo.isNotEmpty()) {
-                d2.categoryModule().categoryOptionCombos()
+                d2Instance.categoryModule().categoryOptionCombos()
                     .uid(categoryOptionCombo)
                     .blockingGet()
                     ?.displayName() ?: categoryOptionCombo
@@ -367,7 +385,7 @@ class DataEntryRepositoryImpl @Inject constructor(
             }
 
             // Get value history
-            val valueHistory = d2.dataValueModule().dataValues()
+            val valueHistory = d2Instance.dataValueModule().dataValues()
                 .byDataElementUid().eq(dataElement)
                 .byPeriod().eq(period)
                 .byOrganisationUnitUid().eq(orgUnit)
@@ -392,7 +410,7 @@ class DataEntryRepositoryImpl @Inject constructor(
                     categoryOptionComboName = categoryOptionComboName,
                     value = value,
                     comment = comment,
-                    storedBy = d2.userModule().user().blockingGet()?.username() ?: "Unknown",
+                    storedBy = d2Instance.userModule().user().blockingGet()?.username() ?: "Unknown",
                     validationState = ValidationState.VALID,
                     dataEntryType = getDataEntryType(dataElementObj),
                     lastModified = System.currentTimeMillis(),
@@ -410,8 +428,9 @@ class DataEntryRepositoryImpl @Inject constructor(
         dataElement: String,
         value: String
     ): DataValueValidationResult {
+        val d2Instance = d2 ?: return DataValueValidationResult(false, ValidationState.ERROR, "D2 session not available")
         return try {
-            val dataElementObj = d2.dataElementModule().dataElements()
+            val dataElementObj = d2Instance.dataElementModule().dataElements()
                 .uid(dataElement)
                 .blockingGet() ?: return DataValueValidationResult(false, ValidationState.ERROR, "Unknown data element type")
 
@@ -452,6 +471,10 @@ class DataEntryRepositoryImpl @Inject constructor(
 
     override suspend fun getAvailablePeriods(datasetId: String, limit: Int, showAll: Boolean): List<Period> {
         return withContext(Dispatchers.IO) {
+            val d2Instance = d2 ?: run {
+                Log.w("DataEntryRepositoryImpl", "D2 session not available for getAvailablePeriods")
+                return@withContext emptyList()
+            }
             // CRITICAL FIX: NEVER generate full period list to prevent ANR
             // Use incremental loading with tracked offset per dataset
 
@@ -468,7 +491,7 @@ class DataEntryRepositoryImpl @Inject constructor(
             }
 
             // Generate ONLY the periods we need (prevents ANR on daily/weekly datasets)
-            d2.periodModule().periodHelper()
+            d2Instance.periodModule().periodHelper()
                 .getPeriodsForDataSet(datasetId)
                 .blockingGet()
                 .sortedByDescending { it.periodId() } // Sort before limiting
@@ -487,16 +510,16 @@ class DataEntryRepositoryImpl @Inject constructor(
 
     override suspend fun getUserOrgUnits(datasetId: String): List<OrganisationUnit> {
         return withContext(Dispatchers.IO) {
-            val scopedOrgUnits = d2.organisationUnitModule().organisationUnits()
-                .byOrganisationUnitScope(org.hisp.dhis.android.core.organisationunit.OrganisationUnit.Scope.SCOPE_DATA_CAPTURE)
-                .blockingGet()
+            // Use cached scoped org units
+            val scopedOrgUnits = orgUnitCache.getScopedOrgUnits()
 
             if (scopedOrgUnits.isEmpty()) {
                 return@withContext emptyList()
             }
 
-            val targetType = resolveTargetType(datasetId)
-            val attachedOrgUnits = getAttachedOrgUnits(datasetId, targetType)
+            val d2Instance = d2Provider.awaitD2()
+            val targetType = resolveTargetType(datasetId, d2Instance)
+            val attachedOrgUnits = getAttachedOrgUnits(datasetId, targetType, d2Instance)
 
             val attachedIds = attachedOrgUnits.map { it.uid() }.toSet()
             val intersected = scopedOrgUnits.filter { it.uid() in attachedIds }
@@ -509,9 +532,8 @@ class DataEntryRepositoryImpl @Inject constructor(
 
     override suspend fun getScopedOrgUnits(): List<OrganisationUnit> {
         return withContext(Dispatchers.IO) {
-            val scopedOrgUnits = d2.organisationUnitModule().organisationUnits()
-                .byOrganisationUnitScope(org.hisp.dhis.android.core.organisationunit.OrganisationUnit.Scope.SCOPE_DATA_CAPTURE)
-                .blockingGet()
+            // Use cached scoped org units
+            val scopedOrgUnits = orgUnitCache.getScopedOrgUnits()
             mapAndSortOrgUnits(scopedOrgUnits)
         }
     }
@@ -519,40 +541,62 @@ class DataEntryRepositoryImpl @Inject constructor(
     override suspend fun getOrgUnitsAttachedToDataSets(datasetIds: List<String>): Set<String> {
         if (datasetIds.isEmpty()) return emptySet()
         return withContext(Dispatchers.IO) {
-            d2.organisationUnitModule().organisationUnits()
+            val d2Instance = d2Provider.awaitD2()
+            d2Instance.organisationUnitModule().organisationUnits()
                 .byDataSetUids(datasetIds)
-                .blockingGet()
+                .get().await()
                 .map { it.uid() }
                 .toSet()
         }
     }
 
+    override suspend fun isDatasetAttachedToScopedOrgUnits(datasetId: String): Boolean {
+        return withContext(Dispatchers.IO) {
+            val scopedOrgUnits = orgUnitCache.getScopedOrgUnits()
+            if (scopedOrgUnits.isEmpty()) {
+                Log.w("DataEntryRepositoryImpl", "Scoped org units empty; suppressing dataset $datasetId")
+                return@withContext false
+            }
+
+            val d2Instance = d2Provider.awaitD2()
+            val attachedOrgUnits = d2Instance.organisationUnitModule().organisationUnits()
+                .byDataSetUids(listOf(datasetId))
+                .get().await()
+
+            if (attachedOrgUnits.isEmpty()) {
+                return@withContext false
+            }
+
+            val scopedIds = scopedOrgUnits.map { it.uid() }.toSet()
+            attachedOrgUnits.any { it.uid() in scopedIds }
+        }
+    }
+
     override suspend fun expandOrgUnitSelection(targetId: String, orgUnitId: String): Set<String> {
         return withContext(Dispatchers.IO) {
-            val targetType = resolveTargetType(targetId)
-
-            val scopedOrgUnits = d2.organisationUnitModule().organisationUnits()
-                .byOrganisationUnitScope(org.hisp.dhis.android.core.organisationunit.OrganisationUnit.Scope.SCOPE_DATA_CAPTURE)
-                .blockingGet()
+            // Use cached scoped org units
+            val scopedOrgUnits = orgUnitCache.getScopedOrgUnits()
             if (scopedOrgUnits.isEmpty()) {
                 return@withContext emptySet()
             }
 
-            val attachedOrgUnits = getAttachedOrgUnits(targetId, targetType)
+            val d2Instance = d2Provider.awaitD2()
+            val targetType = resolveTargetType(targetId, d2Instance)
+            val attachedOrgUnits = getAttachedOrgUnits(targetId, targetType, d2Instance)
             val attachedIds = attachedOrgUnits.map { it.uid() }.toSet()
             val scopedIds = scopedOrgUnits.map { it.uid() }.toSet()
             val allowedIds = scopedIds.intersect(attachedIds).ifEmpty { scopedIds }
 
-            val selected = d2.organisationUnitModule().organisationUnits()
+            val selected = d2Instance.organisationUnitModule().organisationUnits()
                 .uid(orgUnitId)
-                .blockingGet()
+                .get().await()
                 ?: return@withContext emptySet()
 
             val selectedPath = selected.path()
             val descendants = if (!selectedPath.isNullOrBlank()) {
-                d2.organisationUnitModule().organisationUnits()
+                d2Instance.organisationUnitModule().organisationUnits()
                     .byPath().like("$selectedPath/%")
-                    .blockingGet()
+                    .get().await()
             } else {
                 emptyList()
             }
@@ -571,29 +615,29 @@ class DataEntryRepositoryImpl @Inject constructor(
         PROGRAM
     }
 
-    private fun resolveTargetType(targetId: String): TargetType {
-        val isDataset = d2.dataSetModule().dataSets()
+    private suspend fun resolveTargetType(targetId: String, d2Instance: D2): TargetType {
+        val isDataset = d2Instance.dataSetModule().dataSets()
             .uid(targetId)
-            .blockingGet() != null
+            .get().await() != null
         if (isDataset) {
             return TargetType.DATASET
         }
 
-        val isProgram = d2.programModule().programs()
+        val isProgram = d2Instance.programModule().programs()
             .uid(targetId)
-            .blockingGet() != null
+            .get().await() != null
         return if (isProgram) TargetType.PROGRAM else TargetType.DATASET
     }
 
-    private fun getAttachedOrgUnits(targetId: String, targetType: TargetType): List<org.hisp.dhis.android.core.organisationunit.OrganisationUnit> {
-        val repository = d2.organisationUnitModule().organisationUnits()
+    private suspend fun getAttachedOrgUnits(targetId: String, targetType: TargetType, d2Instance: D2): List<org.hisp.dhis.android.core.organisationunit.OrganisationUnit> {
+        val repository = d2Instance.organisationUnitModule().organisationUnits()
         return when (targetType) {
             TargetType.DATASET -> repository
                 .byDataSetUids(listOf(targetId))
-                .blockingGet()
+                .get().await()
             TargetType.PROGRAM -> repository
                 .byProgramUids(listOf(targetId))
-                .blockingGet()
+                .get().await()
         }
     }
 
@@ -617,24 +661,31 @@ class DataEntryRepositoryImpl @Inject constructor(
 
     override suspend fun getDefaultAttributeOptionCombo(): String {
         return withContext(Dispatchers.IO) {
-            d2.categoryModule().categoryOptionCombos()
-                .byDisplayName().eq("default")
-                .one()
-                .blockingGet()
-                ?.uid()
-                ?: "HllvX50cXC0"
+            try {
+                val d2Instance = d2Provider.awaitD2()
+                d2Instance.categoryModule().categoryOptionCombos()
+                    .byDisplayName().eq("default")
+                    .one()
+                    .get().await()
+                    ?.uid()
+                    ?: "HllvX50cXC0"
+            } catch (e: Exception) {
+                Log.w("DataEntryRepositoryImpl", "Failed to get default AOC: ${e.message}")
+                "HllvX50cXC0" // Fallback to standard DHIS2 default
+            }
         }
     }
 
     override suspend fun getAttributeOptionCombos(datasetId: String): List<Pair<String, String>> {
         return withContext(Dispatchers.IO) {
-            val dataSet = d2.dataSetModule().dataSets()
+            val d2Instance = d2Provider.awaitD2()
+            val dataSet = d2Instance.dataSetModule().dataSets()
                 .uid(datasetId)
-                .blockingGet() ?: return@withContext emptyList()
+                .get().await() ?: return@withContext emptyList()
             val categoryComboUid = dataSet.categoryCombo()?.uid() ?: return@withContext emptyList()
-            val combos = d2.categoryModule().categoryOptionCombos()
+            val combos = d2Instance.categoryModule().categoryOptionCombos()
                 .byCategoryComboUid().eq(categoryComboUid)
-                .blockingGet()
+                .get().await()
             combos
                 .sortedBy { (it.displayName() ?: it.uid()).lowercase() }
                 .map { it.uid() to (it.displayName() ?: it.uid()) }
@@ -692,6 +743,11 @@ class DataEntryRepositoryImpl @Inject constructor(
                 return@withContext
             }
 
+            val d2Instance = d2 ?: run {
+                Log.w("DataEntryRepositoryImpl", "D2 session not available for syncCurrentEntryForm")
+                throw Exception("D2 session not available")
+            }
+
             try {
                 // First, upload any local data changes
                 val syncResult = syncQueueManager.startSync()
@@ -701,7 +757,7 @@ class DataEntryRepositoryImpl @Inject constructor(
 
                 // Then download the latest aggregated data from server
                 Log.d("DataEntryRepositoryImpl", "Downloading latest aggregated data from server...")
-                d2.aggregatedModule().data().blockingDownload()
+                d2Instance.aggregatedModule().data().blockingDownload()
 
                 Log.d("DataEntryRepositoryImpl", "Current entry form synced successfully - upload completed and latest data downloaded")
             } catch (e: Exception) {
@@ -716,8 +772,12 @@ class DataEntryRepositoryImpl @Inject constructor(
      * Uses DHIS2 SDK to fetch: formName > shortName > displayName > technical name
      */
     private suspend fun getDataElementDisplayName(dataElementUid: String): String? {
+        val d2Instance = d2 ?: run {
+            Log.w("DataEntryRepositoryImpl", "D2 session not available for getDataElementDisplayName")
+            return null
+        }
         return try {
-            val dataElementObj = d2.dataElementModule().dataElements()
+            val dataElementObj = d2Instance.dataElementModule().dataElements()
                 .uid(dataElementUid)
                 .blockingGet()
 
@@ -732,21 +792,25 @@ class DataEntryRepositoryImpl @Inject constructor(
 
     override suspend fun getOptionSetForDataElement(dataElementId: String): com.ash.simpledataentry.domain.model.OptionSet? {
         return withContext(Dispatchers.IO) {
+            val d2Instance = d2 ?: run {
+                Log.w("DataEntryRepositoryImpl", "D2 session not available for getOptionSetForDataElement")
+                return@withContext null
+            }
             try {
                 // Get data element and check if it has an option set
-                val dataElement = d2.dataElementModule().dataElements()
+                val dataElement = d2Instance.dataElementModule().dataElements()
                     .uid(dataElementId)
                     .blockingGet() ?: return@withContext null
 
                 val optionSetUid = dataElement.optionSet()?.uid() ?: return@withContext null
 
                 // Fetch option set
-                val optionSet = d2.optionModule().optionSets()
+                val optionSet = d2Instance.optionModule().optionSets()
                     .uid(optionSetUid)
                     .blockingGet() ?: return@withContext null
 
                 // Fetch options separately
-                val sdkOptions = d2.optionModule().options()
+                val sdkOptions = d2Instance.optionModule().options()
                     .byOptionSetUid().eq(optionSetUid)
                     .blockingGet()
 
@@ -779,9 +843,13 @@ class DataEntryRepositoryImpl @Inject constructor(
 
     override suspend fun getAllOptionSetsForDataset(datasetId: String): Map<String, com.ash.simpledataentry.domain.model.OptionSet> {
         return withContext(Dispatchers.IO) {
+            val d2Instance = d2 ?: run {
+                Log.w("DataEntryRepositoryImpl", "D2 session not available for getAllOptionSetsForDataset")
+                return@withContext emptyMap()
+            }
             try {
                 // Get all data elements for dataset
-                val dataset = d2.dataSetModule().dataSets()
+                val dataset = d2Instance.dataSetModule().dataSets()
                     .withDataSetElements()
                     .uid(datasetId)
                     .blockingGet() ?: return@withContext emptyMap()
@@ -838,8 +906,12 @@ class DataEntryRepositoryImpl @Inject constructor(
 
     override suspend fun getValidationRulesForDataset(datasetId: String): List<org.hisp.dhis.android.core.validation.ValidationRule> {
         return withContext(Dispatchers.IO) {
+            val d2Instance = d2 ?: run {
+                Log.w("DataEntryRepositoryImpl", "D2 session not available for getValidationRulesForDataset")
+                return@withContext emptyList()
+            }
             try {
-                d2.validationModule().validationRules()
+                d2Instance.validationModule().validationRules()
                     .byDataSetUids(listOf(datasetId))
                     .blockingGet()
             } catch (e: Exception) {

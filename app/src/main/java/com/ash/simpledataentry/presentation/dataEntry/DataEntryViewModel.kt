@@ -8,9 +8,11 @@ import androidx.compose.foundation.layout.size
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.ash.simpledataentry.data.DatabaseProvider
+import com.ash.simpledataentry.data.cache.MetadataCacheService
 import com.ash.simpledataentry.data.local.DataValueDraftEntity
 import com.ash.simpledataentry.data.repositoryImpl.ValidationRepository
 import com.ash.simpledataentry.domain.model.*
+import com.ash.simpledataentry.domain.model.GroupType
 import com.ash.simpledataentry.domain.grouping.DataElementGroupingAnalyzer
 import com.ash.simpledataentry.data.sync.DetailedSyncProgress
 import com.ash.simpledataentry.data.sync.SyncQueueManager
@@ -195,6 +197,33 @@ class DataEntryViewModel @Inject constructor(
 
     private var savePressed = false
 
+    private fun hasBlockingValidationErrors(): Boolean {
+        return _state.value.fieldErrors.isNotEmpty()
+    }
+
+    private data class CategoryMaps(
+        val structuresByOptionCombo: Map<String, List<Pair<String, List<Pair<String, String>>>>>,
+        val optionUidsByOptionCombo: Map<String, Map<Set<String>, String>>
+    )
+
+    private fun buildCategoryMapsFromFormStructure(
+        formStructure: MetadataCacheService.DatasetFormStructure
+    ): CategoryMaps {
+        // BLACKBOX: Category parsing is derived strictly from metadata.
+        // Do not change without profiling; regressions here can cause ANRs.
+        val structuresByOptionCombo = buildMap<String, List<Pair<String, List<Pair<String, String>>>>> {
+            formStructure.categoryOptionCombos.forEach { (optionComboId, optionCombo) ->
+                put(optionComboId, formStructure.categoryStructures[optionCombo.categoryComboId].orEmpty())
+            }
+        }
+        val optionUidsByOptionCombo = buildMap<String, Map<Set<String>, String>> {
+            formStructure.categoryOptionCombos.forEach { (optionComboId, optionCombo) ->
+                put(optionComboId, formStructure.optionUidsToComboUid[optionCombo.categoryComboId].orEmpty())
+            }
+        }
+        return CategoryMaps(structuresByOptionCombo, optionUidsByOptionCombo)
+    }
+
     fun loadDataValues(
         datasetId: String,
         datasetName: String,
@@ -205,6 +234,11 @@ class DataEntryViewModel @Inject constructor(
     ) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
+                // BLACKBOX: Category parsing is derived strictly from metadata.
+                // Do not change without profiling; regressions here can cause ANRs.
+                val formStructure = metadataCacheService.getDatasetFormStructure(datasetId)
+                val categoryMaps = buildCategoryMapsFromFormStructure(formStructure)
+
                 val editabilityDeferred = async {
                     resolveDatasetEditability(
                         datasetId = datasetId,
@@ -295,44 +329,8 @@ class DataEntryViewModel @Inject constructor(
                             )
                         )
                     }
-
-                    val uniqueCategoryCombos = values
-                        .mapNotNull { it.categoryOptionCombo }
-                        .filter { it.isNotBlank() }
-                        .distinct()
-                        .toSet()
-
-                    val categoryComboStructures = mutableMapOf<String, List<Pair<String, List<Pair<String, String>>>>>()
-                    val optionUidsToComboUid = mutableMapOf<String, Map<Set<String>, String>>()
-
-                    Log.d("DataEntryViewModel", "=== CATEGORY COMBO STRUCTURE LOADING ===")
-                    Log.d("DataEntryViewModel", "Found ${uniqueCategoryCombos.size} unique category option combos")
-
-                    uniqueCategoryCombos.map { comboUid ->
-                        async {
-                            if (!categoryComboStructures.containsKey(comboUid)) {
-                                val structure = repository.getCategoryComboStructure(comboUid)
-                                categoryComboStructures[comboUid] = structure
-
-                                // DEBUG: Log the structure for each combo
-                                if (structure.isEmpty()) {
-                                    Log.d("DataEntryViewModel", "  ComboUID $comboUid -> EMPTY structure (default)")
-                                } else {
-                                    Log.d("DataEntryViewModel", "  ComboUID $comboUid -> ${structure.size} categories:")
-                                    structure.forEach { (catName, options) ->
-                                        Log.d("DataEntryViewModel", "    - $catName: ${options.size} options")
-                                    }
-                                }
-
-                                val combos = repository.getCategoryOptionCombos(comboUid)
-                                val map = combos.associate { coc ->
-                                    val optionUids = coc.second.toSet()
-                                    optionUids to coc.first
-                                }
-                                optionUidsToComboUid[comboUid] = map
-                            }
-                        }
-                    }.awaitAll()
+                    val categoryComboStructures = categoryMaps.structuresByOptionCombo
+                    val optionUidsToComboUid = categoryMaps.optionUidsByOptionCombo
 
                     Log.d("DataEntryViewModel", "=== CATEGORY COMBO STRUCTURE SUMMARY ===")
                     Log.d("DataEntryViewModel", "Total structures loaded: ${categoryComboStructures.size}")
@@ -567,6 +565,219 @@ class DataEntryViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Load a NEW entry - uses cached metadata only, no data value loading.
+     * This is the decoupled approach: metadata is loaded from cache,
+     * empty DataValues are generated from the form structure.
+     *
+     * Key benefits:
+     * - No SDK calls for data values (there are none for new entries)
+     * - Category structures come from metadata, not from data values
+     * - Much faster loading for new entries
+     */
+    fun loadNewEntry(
+        datasetId: String,
+        datasetName: String,
+        period: String,
+        orgUnitId: String,
+        attributeOptionCombo: String
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                Log.d("DataEntryViewModel", "=== LOADING NEW ENTRY (metadata-only approach) ===")
+                Log.d("DataEntryViewModel", "Dataset: $datasetId, Period: $period, OrgUnit: $orgUnitId")
+
+                // Set initial loading state
+                val initialProgress = com.ash.simpledataentry.presentation.core.NavigationProgress(
+                    phase = com.ash.simpledataentry.presentation.core.LoadingPhase.INITIALIZING,
+                    overallPercentage = 10,
+                    phaseTitle = com.ash.simpledataentry.presentation.core.LoadingPhase.INITIALIZING.title,
+                    phaseDetail = "Loading form structure...",
+                    loadingType = com.ash.simpledataentry.presentation.core.StepLoadingType.ENTRY
+                )
+                updateState { currentState ->
+                    currentState.copy(
+                        isLoading = true,
+                        error = null,
+                        datasetId = datasetId,
+                        datasetName = datasetName,
+                        period = period,
+                        orgUnit = orgUnitId,
+                        attributeOptionCombo = attributeOptionCombo,
+                        isEditMode = false, // New entry = not edit mode
+                        navigationProgress = initialProgress
+                    )
+                }
+                setUiLoading(
+                    operation = LoadingOperation.Navigation(initialProgress),
+                    progress = LoadingProgress(message = initialProgress.phaseDetail)
+                )
+
+                // Step 1: Load form structure from cached metadata (fast!)
+                updateState {
+                    it.copy(
+                        navigationProgress = com.ash.simpledataentry.presentation.core.NavigationProgress(
+                            phase = com.ash.simpledataentry.presentation.core.LoadingPhase.LOADING_DATA,
+                            overallPercentage = 30,
+                            phaseTitle = "Loading metadata",
+                            phaseDetail = "Getting form structure from cache...",
+                            loadingType = com.ash.simpledataentry.presentation.core.StepLoadingType.ENTRY
+                        )
+                    )
+                }
+
+                val formStructure = metadataCacheService.getDatasetFormStructure(datasetId)
+                Log.d("DataEntryViewModel", "Form structure loaded: ${formStructure.sections.size} sections, ${formStructure.dataElements.size} data elements")
+                val categoryMaps = buildCategoryMapsFromFormStructure(formStructure)
+                val categoryStructuresByOptionCombo = categoryMaps.structuresByOptionCombo
+                val optionUidsToComboUidByOptionCombo = categoryMaps.optionUidsByOptionCombo
+
+                // Step 2: Generate empty data values from metadata (no SDK calls!)
+                updateState {
+                    it.copy(
+                        navigationProgress = com.ash.simpledataentry.presentation.core.NavigationProgress(
+                            phase = com.ash.simpledataentry.presentation.core.LoadingPhase.PROCESSING_DATA,
+                            overallPercentage = 50,
+                            phaseTitle = "Preparing form",
+                            phaseDetail = "Generating entry fields...",
+                            loadingType = com.ash.simpledataentry.presentation.core.StepLoadingType.ENTRY
+                        )
+                    )
+                }
+
+                val emptyValues = metadataCacheService.generateEmptyDataValues(formStructure)
+                Log.d("DataEntryViewModel", "Generated ${emptyValues.size} empty data values")
+
+                // Step 3: Get attribute option combos for the dataset
+                val attributeOptionCombos = repository.getAttributeOptionCombos(datasetId)
+                val attributeOptionComboName = attributeOptionCombos.find { it.first == attributeOptionCombo }?.second ?: attributeOptionCombo
+
+                // Step 4: Build grouped sections
+                updateState {
+                    it.copy(
+                        navigationProgress = com.ash.simpledataentry.presentation.core.NavigationProgress(
+                            phase = com.ash.simpledataentry.presentation.core.LoadingPhase.PROCESSING_DATA,
+                            overallPercentage = 70,
+                            phaseTitle = "Organizing form",
+                            phaseDetail = "Building sections...",
+                            loadingType = com.ash.simpledataentry.presentation.core.StepLoadingType.ENTRY
+                        )
+                    )
+                }
+
+                val groupedBySection = emptyValues.groupBy { it.sectionName }
+                val valuesByElement = emptyValues.groupBy { it.dataElement }
+                val valuesByCombo = emptyValues.groupBy { it.categoryOptionCombo }
+
+                // Build dataElementsBySection for navigation
+                val dataElementsBySection = groupedBySection.mapValues { (_, sectionValues) ->
+                    sectionValues
+                        .map { it.dataElement to it.dataElementName }
+                        .distinctBy { it.first }
+                }
+
+                // Build dataElementGroupedSections
+                val dataElementGroupedSections = groupedBySection.mapValues { (_, sectionValues) ->
+                    sectionValues.groupBy { it.dataElement }
+                }
+
+                // Step 5: Analyze grouping strategies (from cache if available)
+                updateState {
+                    it.copy(
+                        navigationProgress = com.ash.simpledataentry.presentation.core.NavigationProgress(
+                            phase = com.ash.simpledataentry.presentation.core.LoadingPhase.PROCESSING_DATA,
+                            overallPercentage = 85,
+                            phaseTitle = "Finalizing",
+                            phaseDetail = "Analyzing data grouping...",
+                            loadingType = com.ash.simpledataentry.presentation.core.StepLoadingType.ENTRY
+                        )
+                    )
+                }
+
+                val validationRules = repository.getValidationRulesForDataset(datasetId)
+                val sectionGroupingStrategies = metadataCacheService.getGroupingStrategies(datasetId) ?: run {
+                    val computed = withContext(Dispatchers.Default) {
+                        groupedBySection.mapValues { (sectionName, sectionValues) ->
+                            groupingAnalyzer.analyzeGrouping(
+                                dataElements = sectionValues,
+                                categoryComboStructures = categoryStructuresByOptionCombo,
+                                optionSets = formStructure.optionSets,
+                                validationRules = validationRules
+                            )
+                        }
+                    }
+                    metadataCacheService.setGroupingStrategies(datasetId, computed)
+                    computed
+                }
+
+                // Build radio/checkbox groups from strategies
+                val radioButtonGroups = mutableMapOf<String, List<String>>()
+                val checkboxGroups = mutableMapOf<String, List<String>>()
+                sectionGroupingStrategies.forEach { (_, strategies) ->
+                    strategies.forEach { strategy ->
+                        val dataElementIds = strategy.members.map { it.dataElement }.distinct()
+                        when (strategy.groupType) {
+                            GroupType.RADIO_GROUP -> radioButtonGroups[strategy.groupTitle] = dataElementIds
+                            GroupType.CHECKBOX_GROUP -> checkboxGroups[strategy.groupTitle] = dataElementIds
+                            else -> {}
+                        }
+                    }
+                }
+
+                // Build data element ordering
+                val dataElementOrdering = dataElementsBySection.mapValues { (_, elements) ->
+                    elements.mapIndexed { index, (elementId, _) -> elementId to index }.toMap()
+                }
+
+                // Step 6: Finalize state
+                updateState { currentState ->
+                    currentState.copy(
+                        isLoading = false,
+                        dataValues = emptyValues,
+                        // Category structures from metadata (not from data values!)
+                        categoryComboStructures = categoryStructuresByOptionCombo,
+                        optionUidsToComboUid = optionUidsToComboUidByOptionCombo,
+                        attributeOptionCombos = attributeOptionCombos,
+                        attributeOptionComboName = attributeOptionComboName,
+                        valuesByCombo = valuesByCombo,
+                        valuesByElement = valuesByElement,
+                        dataElementsBySection = dataElementsBySection,
+                        dataElementGroupedSections = dataElementGroupedSections,
+                        currentSectionIndex = 0,
+                        totalSections = groupedBySection.size,
+                        optionSets = formStructure.optionSets,
+                        renderTypes = formStructure.renderTypes,
+                        radioButtonGroups = radioButtonGroups,
+                        checkboxGroups = checkboxGroups,
+                        sectionGroupingStrategies = sectionGroupingStrategies,
+                        dataElementOrdering = dataElementOrdering,
+                        navigationProgress = null,
+                        isEntryEditable = true, // New entries are always editable
+                        nonEditableReason = null,
+                        isCompleted = false,
+                        metadataDisabledFields = emptySet()
+                    )
+                }
+
+                Log.d("DataEntryViewModel", "=== NEW ENTRY LOADED SUCCESSFULLY ===")
+                Log.d("DataEntryViewModel", "Sections: ${groupedBySection.size}, Values: ${emptyValues.size}")
+
+                emitSuccessState()
+
+            } catch (e: Exception) {
+                Log.e("DataEntryViewModel", "Failed to load new entry", e)
+                updateState { currentState ->
+                    currentState.copy(
+                        error = "Failed to load form: ${e.message}",
+                        isLoading = false,
+                        navigationProgress = com.ash.simpledataentry.presentation.core.NavigationProgress.error(e.message ?: "Failed to load form")
+                    )
+                }
+                setUiError(UiError.Local(e.message ?: "Failed to load form"))
+            }
+        }
+    }
+
     private suspend fun resolveDatasetEditability(
         datasetId: String,
         period: String,
@@ -654,6 +865,17 @@ class DataEntryViewModel @Inject constructor(
                 )
             }
 
+            val validationError = validateEntryValue(updatedValueObject, value)
+            updateState { currentState ->
+                val updatedErrors = currentState.fieldErrors.toMutableMap()
+                if (validationError.isNullOrBlank()) {
+                    updatedErrors.remove(dataElementUid)
+                } else {
+                    updatedErrors[dataElementUid] = validationError
+                }
+                currentState.copy(fieldErrors = updatedErrors)
+            }
+
             viewModelScope.launch(Dispatchers.IO) {
                 if (value.isNotBlank()) {
                     draftDao.upsertDraft(
@@ -688,6 +910,49 @@ class DataEntryViewModel @Inject constructor(
         }
     }
 
+    private fun validateEntryValue(dataValue: DataValue, value: String?): String? {
+        val validations = dataValue.dataEntryType.getDefaultValidation()
+        if (validations.isEmpty()) return null
+
+        val input = value.orEmpty()
+        if (input.isBlank()) return null
+
+        validations.forEach { validation ->
+            when (validation) {
+                is DataEntryValidation.Pattern -> {
+                    if (!Regex(validation.regex).matches(input)) {
+                        return validation.message
+                    }
+                }
+                is DataEntryValidation.MinValue -> {
+                    val numeric = input.toDoubleOrNull() ?: return validation.message
+                    if (numeric < validation.value) {
+                        return validation.message
+                    }
+                }
+                is DataEntryValidation.MaxValue -> {
+                    val numeric = input.toDoubleOrNull() ?: return validation.message
+                    if (numeric > validation.value) {
+                        return validation.message
+                    }
+                }
+                is DataEntryValidation.Custom -> {
+                    val result = validation.validator(input)
+                    if (!result.isValid) {
+                        return result.message
+                    }
+                }
+                is DataEntryValidation.Required -> {
+                    if (input.isBlank()) {
+                        return validation.message
+                    }
+                }
+            }
+        }
+
+        return null
+    }
+
     /**
      * Update all fields in a grouped radio button set
      * Set selected field to "1" (Yes), all others to "0" (No)
@@ -703,6 +968,10 @@ class DataEntryViewModel @Inject constructor(
 
     fun saveAllDataValues(context: android.content.Context? = null) {
         viewModelScope.launch {
+            if (hasBlockingValidationErrors()) {
+                updateState { it.copy(error = "Please fix the highlighted field errors before saving.") }
+                return@launch
+            }
             updateState { it.copy(saveInProgress = true, saveResult = null) }
             savePressed = true
             val stateSnapshot = _state.value
@@ -744,6 +1013,10 @@ class DataEntryViewModel @Inject constructor(
 
     fun syncCurrentEntryForm() {
         viewModelScope.launch {
+            if (hasBlockingValidationErrors()) {
+                updateState { it.copy(error = "Please fix the highlighted field errors before syncing.") }
+                return@launch
+            }
             updateState { it.copy(isLoading = true, error = null) }
             val stateSnapshot = _state.value
             // More permissive network check - allow 2G connections
@@ -802,30 +1075,15 @@ class DataEntryViewModel @Inject constructor(
                         repository.syncCurrentEntryForm()
                     }
                     Log.d("DataEntryViewModel", "Data values uploaded successfully: $uploadResult")
-                    // Only delete drafts if uploadResult is not null/empty
-                    if (uploadResult != null && uploadResult.toString().isNotBlank()) {
-                        withContext(Dispatchers.IO) {
-                            draftDao.deleteDraftsForInstance(
-                                stateSnapshot.datasetId,
-                                stateSnapshot.period,
-                                stateSnapshot.orgUnit,
-                                stateSnapshot.attributeOptionCombo
-                            )
-                        }
-                        Log.d("DataEntryViewModel", "Drafts deleted after successful upload")
-                    } else {
-                        Log.e(
-                            "DataEntryViewModel",
-                            "Upload failed or returned empty result: $uploadResult"
+                    withContext(Dispatchers.IO) {
+                        draftDao.deleteDraftsForInstance(
+                            stateSnapshot.datasetId,
+                            stateSnapshot.period,
+                            stateSnapshot.orgUnit,
+                            stateSnapshot.attributeOptionCombo
                         )
-                        updateState {
-                            it.copy(
-                                isLoading = false,
-                                error = "Upload failed or returned empty result."
-                            )
-                        }
-                        return@launch
                     }
+                    Log.d("DataEntryViewModel", "Drafts deleted after successful upload")
                 } catch (e: Exception) {
                     Log.e("DataEntryViewModel", "Upload failed: ${'$'}{e.message}", e)
                     updateState {

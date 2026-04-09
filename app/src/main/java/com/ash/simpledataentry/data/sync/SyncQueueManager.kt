@@ -5,6 +5,7 @@ import android.os.PowerManager
 import android.util.Log
 import com.ash.simpledataentry.data.SessionManager
 import com.ash.simpledataentry.data.DatabaseProvider
+import com.ash.simpledataentry.data.D2Provider
 import com.ash.simpledataentry.data.local.DataValueDraftEntity
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -93,7 +94,8 @@ class SyncQueueManager @Inject constructor(
     private val networkStateManager: NetworkStateManager,
     private val sessionManager: SessionManager,
     private val databaseProvider: DatabaseProvider,
-    private val context: Context
+    private val context: Context,
+    private val d2Provider: D2Provider
 ) {
 
     private val tag = "SyncQueueManager"
@@ -321,7 +323,11 @@ class SyncQueueManager @Inject constructor(
                 return // Error state already set in validateConnection()
             }
 
-            val d2 = sessionManager.getD2()!! // Already validated in validateConnection()
+            val d2 = sessionManager.getD2() ?: run {
+                Log.e(tag, "D2 session became null after validation")
+                setErrorState(SyncError.AuthenticationError("DHIS2 session lost. Please log in again."))
+                return
+            }
 
             // Get all draft data values to sync
             val drafts = databaseProvider.getCurrentDatabase().dataValueDraftDao().getAllDrafts()
@@ -524,7 +530,11 @@ class SyncQueueManager @Inject constructor(
                 return // Error state already set in validateConnection()
             }
 
-            val d2 = sessionManager.getD2()!! // Already validated in validateConnection()
+            val d2 = sessionManager.getD2() ?: run {
+                Log.e(tag, "D2 session became null after validation")
+                setErrorState(SyncError.AuthenticationError("DHIS2 session lost. Please log in again."))
+                return
+            }
 
             // Count available items to show granular progress
             val datasetCount = try {

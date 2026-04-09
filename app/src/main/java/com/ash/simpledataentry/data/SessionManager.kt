@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.filterNotNull
 import org.hisp.dhis.android.core.D2
 import org.hisp.dhis.android.core.D2Configuration
 import org.hisp.dhis.android.core.D2Manager
@@ -74,7 +75,48 @@ class SessionManager @Inject constructor(
     private val _currentAccountId = MutableStateFlow<String?>(null)
     val currentAccountId: StateFlow<String?> = _currentAccountId.asStateFlow()
 
+    /**
+     * Indicates whether the D2 session is fully initialized and ready for use.
+     * Repositories should check this before making SDK calls.
+     */
+    private val _sessionReady = MutableStateFlow(false)
+    val sessionReady: StateFlow<Boolean> = _sessionReady.asStateFlow()
+
+    /**
+     * Holds the D2 instance in a StateFlow for suspending access.
+     * Use awaitD2() to wait for the session to be ready.
+     */
+    private val _d2StateFlow = MutableStateFlow<D2?>(null)
+
     private val mutex = kotlinx.coroutines.sync.Mutex()
+
+    /**
+     * Suspending function that waits for D2 to be ready.
+     * Use this in repositories instead of getD2() to avoid race conditions.
+     */
+    suspend fun awaitD2(): D2 {
+        return _d2StateFlow.filterNotNull().first()
+    }
+
+    /**
+     * Marks the session as ready after successful initialization.
+     * Called after login/session restoration completes.
+     */
+    private fun markSessionReady() {
+        _d2StateFlow.value = d2
+        _sessionReady.value = true
+        Log.d("SessionManager", "Session marked as READY")
+    }
+
+    /**
+     * Marks the session as not ready during transitions.
+     * Called before logout/account switch.
+     */
+    private fun markSessionNotReady() {
+        _sessionReady.value = false
+        // Note: Don't null _d2StateFlow here - let ongoing operations complete
+        Log.d("SessionManager", "Session marked as NOT READY")
+    }
 
     /**
      * Extract D2Error from potentially nested exceptions.
@@ -162,6 +204,9 @@ class SessionManager @Inject constructor(
             Log.d("SessionManager", "ACCOUNT SWITCH DETECTED: $activeAccountId → ${accountInfo.accountId}")
             Log.d("SessionManager", "Logging out previous user...")
 
+            // Mark session as not ready during account switch
+            markSessionNotReady()
+
             // Log out previous user
             try {
                 d2?.userModule()?.blockingLogOut()
@@ -205,6 +250,9 @@ class SessionManager @Inject constructor(
             downloadMetadataResilient { _ -> /* No progress UI in simple login */ }
             downloadAggregateData()
             hydrateRoomFromSdk(context, accountDb)
+
+            // Mark session as ready after successful initialization
+            markSessionReady()
 
             Log.i("SessionManager", "Login successful for ${dhis2Config.username}")
         } catch (e: Exception) {
@@ -290,6 +338,9 @@ class SessionManager @Inject constructor(
                     phaseTitle = LoadingPhase.INITIALIZING.title,
                     phaseDetail = "Switching accounts..."
                 ))
+
+                // Mark session as not ready during account switch
+                markSessionNotReady()
 
                 // Log out previous user
                 try {
@@ -444,6 +495,9 @@ class SessionManager @Inject constructor(
                 phaseDetail = "Login complete!"
             ))
 
+            // Mark session as ready after successful initialization
+            markSessionReady()
+
             Log.i("SessionManager", "Enhanced login successful for ${dhis2Config.username}")
 
             onProgress(NavigationProgress(
@@ -498,6 +552,9 @@ class SessionManager @Inject constructor(
     suspend fun wipeAllData(context: Context, db: AppDatabase) = withContext(Dispatchers.IO) {
         try {
             Log.w("SessionManager", "USER SWITCH DETECTED: Wiping data for previous user...")
+
+            // Mark session as not ready during data wipe
+            markSessionNotReady()
 
             // STEP 1: Clear Room database FIRST (synchronous, guaranteed)
             clearRoomDatabase(db)
@@ -737,6 +794,9 @@ class SessionManager @Inject constructor(
 
                 // Hydrate Room database from existing SDK data
                 hydrateRoomFromSdk(context, accountDb)
+
+                // Mark session as ready after successful offline login
+                markSessionReady()
 
                 Log.i("SessionManager", "SECURE offline login successful for ${dhis2Config.username}")
                 true
@@ -1352,6 +1412,9 @@ class SessionManager @Inject constructor(
                     // This ensures DatasetsViewModel reloads from the correct database
                     _currentAccountId.value = activeAccountInfo.accountId
                     Log.d("SessionManager", "Emitted currentAccountId: ${activeAccountInfo.accountId}")
+
+                    // Mark session as ready after successful restoration
+                    markSessionReady()
                 } else {
                     Log.w("SessionManager", "User is logged in but no active account found - database may be stale")
                 }
@@ -1391,6 +1454,9 @@ class SessionManager @Inject constructor(
                     // Emit account ID to trigger ViewModel reloads
                     _currentAccountId.value = accountInfo.accountId
                     Log.d("SessionManager", "Offline session: emitted currentAccountId: ${accountInfo.accountId}")
+
+                    // Mark session as ready after successful offline restoration
+                    markSessionReady()
                 } else {
                     Log.w("SessionManager", "No user data available for offline session restoration")
                 }

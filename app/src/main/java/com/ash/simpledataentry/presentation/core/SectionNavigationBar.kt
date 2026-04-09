@@ -39,6 +39,8 @@ fun SectionNavigationBar(
     onNextSection: () -> Unit,
     onPreviousSubsection: () -> Unit,
     onNextSubsection: () -> Unit,
+    canPreviousSubsection: Boolean,
+    canNextSubsection: Boolean,
     hasSubsections: Boolean,
     modifier: Modifier = Modifier
 ) {
@@ -92,7 +94,10 @@ fun SectionNavigationBar(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.Center
                 ) {
-                    IconButton(onClick = onPreviousSubsection) {
+                    IconButton(
+                        onClick = onPreviousSubsection,
+                        enabled = canPreviousSubsection
+                    ) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.KeyboardArrowLeft,
                             contentDescription = "Previous subsection"
@@ -105,7 +110,10 @@ fun SectionNavigationBar(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
-                    IconButton(onClick = onNextSubsection) {
+                    IconButton(
+                        onClick = onNextSubsection,
+                        enabled = canNextSubsection
+                    ) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
                             contentDescription = "Next subsection"

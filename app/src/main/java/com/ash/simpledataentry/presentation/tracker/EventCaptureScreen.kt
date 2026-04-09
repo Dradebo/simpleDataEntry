@@ -479,6 +479,8 @@ fun EventCaptureScreen(
                                         },
                                         onPreviousSubsection = {},
                                         onNextSubsection = {},
+                                        canPreviousSubsection = false,
+                                        canNextSubsection = false,
                                         hasSubsections = false,
                                         modifier = Modifier.padding(bottom = 8.dp)
                                     )

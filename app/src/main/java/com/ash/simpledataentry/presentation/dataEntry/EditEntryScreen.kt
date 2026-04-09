@@ -59,6 +59,10 @@ import com.ash.simpledataentry.presentation.core.Subsection
 import com.ash.simpledataentry.presentation.core.LoadingOperation
 import com.ash.simpledataentry.presentation.core.LoadingProgress
 import com.ash.simpledataentry.presentation.core.UiState
+import com.ash.simpledataentry.presentation.core.DatePickerDialog
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.Date
 
 data class Quadruple<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
 
@@ -76,7 +80,8 @@ fun SectionContent(
     viewModel: DataEntryViewModel,
     expandedAccordions: Map<List<String>, String?>,
     onToggle: (List<String>, String) -> Unit,
-    onElementSelected: (String) -> Unit
+    onElementSelected: (String) -> Unit,
+    focusedElementKey: String?
 ) {
     // Get distinct data elements in order
     val dataElements = if (dataElementsForSection.isNotEmpty()) dataElementsForSection
@@ -98,6 +103,8 @@ fun SectionContent(
             header = dataElementName,
             hasData = hasData,
             expanded = isExpanded,
+            elementKey = elementKey,
+            focusedElementKey = focusedElementKey,
             onToggleExpand = {
                 onToggle(emptyList(), elementKey)
                 onElementSelected(dataElement)
@@ -108,7 +115,8 @@ fun SectionContent(
                 DataValueField(
                     dataValue = firstValue,
                     onValueChange = { value -> onValueChange(value, firstValue) },
-                    viewModel = viewModel
+                    viewModel = viewModel,
+                    showTitle = false
                 )
             } else {
                 // Has category combo - render nested category accordions
@@ -143,7 +151,8 @@ fun DataElementRow(
             DataValueField(
                 dataValue = dataValue,
                 onValueChange = { value -> onValueChange(value, dataValue) },
-                viewModel = viewModel
+                viewModel = viewModel,
+                showTitle = false
             )
         }
     }
@@ -155,7 +164,8 @@ fun DataValueField(
     dataValue: DataValue,
     onValueChange: (String) -> Unit,
     viewModel: DataEntryViewModel,
-    enabled: Boolean = true
+    enabled: Boolean = true,
+    showTitle: Boolean = true
 ) {
     val key = remember(dataValue.dataElement, dataValue.categoryOptionCombo) {
         "${dataValue.dataElement}|${dataValue.categoryOptionCombo}"
@@ -204,7 +214,7 @@ fun DataValueField(
                         com.ash.simpledataentry.presentation.dataEntry.components.OptionSetDropdown(
                             optionSet = optionSet,
                             selectedCode = calculatedValue ?: dataValue.value,
-                            title = dataValue.dataElementName + if (isMandatoryByRule) " *" else "",
+                            title = if (showTitle) dataValue.dataElementName + if (isMandatoryByRule) " *" else "" else "",
                             isRequired = isMandatoryByRule,
                             enabled = effectiveEnabled,
                             onOptionSelected = { selectedCode ->
@@ -219,7 +229,7 @@ fun DataValueField(
                         com.ash.simpledataentry.presentation.dataEntry.components.OptionSetRadioGroup(
                             optionSet = optionSet,
                             selectedCode = calculatedValue ?: dataValue.value,
-                            title = dataValue.dataElementName + if (isMandatoryByRule) " *" else "",
+                            title = if (showTitle) dataValue.dataElementName + if (isMandatoryByRule) " *" else "" else "",
                             isRequired = isMandatoryByRule,
                             enabled = effectiveEnabled,
                             onOptionSelected = { selectedCode ->
@@ -231,15 +241,14 @@ fun DataValueField(
                         )
                     }
                     RenderType.YES_NO_BUTTONS -> {
-                        com.ash.simpledataentry.presentation.dataEntry.components.YesNoCheckbox(
-                            selectedValue = calculatedValue ?: dataValue.value,
-                            title = dataValue.dataElementName + if (isMandatoryByRule) " *" else "",
+                        com.ash.simpledataentry.presentation.dataEntry.components.OptionSetYesNoButtons(
+                            optionSet = optionSet,
+                            selectedCode = calculatedValue ?: dataValue.value,
+                            title = if (showTitle) dataValue.dataElementName + if (isMandatoryByRule) " *" else "" else "",
                             isRequired = isMandatoryByRule,
                             enabled = effectiveEnabled,
-                            onValueChanged = { newValue ->
-                                if (newValue != null) {
-                                    onValueChange(newValue)
-                                }
+                            onOptionSelected = { selectedCode ->
+                                onValueChange(selectedCode)
                             },
                             modifier = Modifier.fillMaxWidth()
                         )
@@ -248,7 +257,7 @@ fun DataValueField(
                         com.ash.simpledataentry.presentation.dataEntry.components.OptionSetDropdown(
                             optionSet = optionSet,
                             selectedCode = calculatedValue ?: dataValue.value,
-                            title = dataValue.dataElementName + if (isMandatoryByRule) " *" else "",
+                            title = if (showTitle) dataValue.dataElementName + if (isMandatoryByRule) " *" else "" else "",
                             isRequired = isMandatoryByRule,
                             enabled = effectiveEnabled,
                             onOptionSelected = { selectedCode ->
@@ -262,34 +271,57 @@ fun DataValueField(
                 }
             }
             dataValue.dataEntryType == DataEntryType.YES_NO -> {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    Button(
-                        text = "Yes",
-                        style = if (dataValue.value == "true") ButtonStyle.FILLED else ButtonStyle.OUTLINED,
-                        colorStyle = ColorStyle.DEFAULT,
-                        modifier = Modifier.weight(1f),
-                        enabled = effectiveEnabled,
-                        onClick = { if (effectiveEnabled) onValueChange("true") }
-                    )
-                    Button(
-                        text = "No",
-                        style = if (dataValue.value == "false") ButtonStyle.FILLED else ButtonStyle.OUTLINED,
-                        colorStyle = ColorStyle.DEFAULT,
-                        modifier = Modifier.weight(1f),
-                        enabled = effectiveEnabled,
-                        onClick = { if (effectiveEnabled) onValueChange("false") }
-                    )
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    if (showTitle) {
+                        Text(
+                            text = dataValue.dataElementName + if (isMandatoryByRule) " *" else "",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Button(
+                            text = "Yes",
+                            style = if (dataValue.value == "true") ButtonStyle.FILLED else ButtonStyle.OUTLINED,
+                            colorStyle = ColorStyle.DEFAULT,
+                            modifier = Modifier.weight(1f),
+                            enabled = effectiveEnabled,
+                            onClick = { if (effectiveEnabled) onValueChange("true") }
+                        )
+                        Button(
+                            text = "No",
+                            style = if (dataValue.value == "false") ButtonStyle.FILLED else ButtonStyle.OUTLINED,
+                            colorStyle = ColorStyle.DEFAULT,
+                            modifier = Modifier.weight(1f),
+                            enabled = effectiveEnabled,
+                            onClick = { if (effectiveEnabled) onValueChange("false") }
+                        )
+                    }
                 }
+            }
+            dataValue.dataEntryType == DataEntryType.TRUE_ONLY -> {
+                com.ash.simpledataentry.presentation.dataEntry.components.YesNoCheckbox(
+                    selectedValue = dataValue.value,
+                    title = if (showTitle) dataValue.dataElementName + if (isMandatoryByRule) " *" else "" else "",
+                    isRequired = isMandatoryByRule,
+                    enabled = effectiveEnabled,
+                    onValueChanged = { newValue ->
+                        if (newValue != null) {
+                            onValueChange(newValue)
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                )
             }
             dataValue.dataEntryType == DataEntryType.NUMBER ||
                     dataValue.dataEntryType == DataEntryType.INTEGER ||
                     dataValue.dataEntryType == DataEntryType.POSITIVE_INTEGER ||
                     dataValue.dataEntryType == DataEntryType.NEGATIVE_INTEGER -> {
                 InputNumber(
-                    title = dataValue.dataElementName + if (isMandatoryByRule) " *" else "",
+                    title = if (showTitle) dataValue.dataElementName + if (isMandatoryByRule) " *" else "" else "",
                     state = when {
                         !effectiveEnabled -> InputShellState.DISABLED
                         dataValue.validationState == ValidationState.ERROR || error != null -> InputShellState.ERROR
@@ -303,9 +335,66 @@ fun DataValueField(
                     modifier = Modifier.fillMaxWidth()
                 )
             }
+            dataValue.dataEntryType == DataEntryType.DATE -> {
+                val dateFormatter = remember { SimpleDateFormat("yyyy-MM-dd", Locale.US) }
+                val parsedDate = remember(fieldState.text) {
+                    runCatching { dateFormatter.parse(fieldState.text) }.getOrNull()
+                }
+                var showDatePicker by remember { mutableStateOf(false) }
+
+                InputText(
+                    title = if (showTitle) dataValue.dataElementName + if (isMandatoryByRule) " *" else "" else "",
+                    state = when {
+                        !effectiveEnabled -> InputShellState.DISABLED
+                        dataValue.validationState == ValidationState.ERROR || error != null -> InputShellState.ERROR
+                        dataValue.validationState == ValidationState.WARNING || warning != null -> InputShellState.WARNING
+                        else -> InputShellState.UNFOCUSED
+                    },
+                    inputTextFieldValue = fieldState,
+                    onValueChanged = { newValue ->
+                        if (newValue != null && effectiveEnabled) {
+                            viewModel.onFieldValueChange(newValue, dataValue)
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(enabled = effectiveEnabled) { showDatePicker = true }
+                )
+
+                if (showDatePicker) {
+                    DatePickerDialog(
+                        onDateSelected = { selected ->
+                            val formatted = dateFormatter.format(selected)
+                            viewModel.onFieldValueChange(TextFieldValue(formatted), dataValue)
+                            showDatePicker = false
+                        },
+                        onDismissRequest = { showDatePicker = false },
+                        initialDate = parsedDate ?: Date()
+                    )
+                }
+            }
+            dataValue.dataEntryType == DataEntryType.PHONE_NUMBER -> {
+                InputText(
+                    title = if (showTitle) dataValue.dataElementName + if (isMandatoryByRule) " *" else "" else "",
+                    state = when {
+                        !effectiveEnabled -> InputShellState.DISABLED
+                        dataValue.validationState == ValidationState.ERROR || error != null -> InputShellState.ERROR
+                        dataValue.validationState == ValidationState.WARNING || warning != null -> InputShellState.WARNING
+                        else -> InputShellState.UNFOCUSED
+                    },
+                    inputTextFieldValue = fieldState,
+                    onValueChanged = { newValue ->
+                        if (newValue != null && effectiveEnabled) {
+                            val digitsOnly = newValue.text.filter { it.isDigit() }
+                            viewModel.onFieldValueChange(newValue.copy(text = digitsOnly), dataValue)
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
             dataValue.dataEntryType == DataEntryType.PERCENTAGE -> {
                 InputText(
-                    title = dataValue.dataElementName + if (isMandatoryByRule) " *" else "",
+                    title = if (showTitle) dataValue.dataElementName + if (isMandatoryByRule) " *" else "" else "",
                     state = when {
                         !effectiveEnabled -> InputShellState.DISABLED
                         dataValue.validationState == ValidationState.ERROR || error != null -> InputShellState.ERROR
@@ -321,7 +410,7 @@ fun DataValueField(
             }
             else -> {
                 InputText(
-                    title = dataValue.dataElementName + if (isMandatoryByRule) " *" else "",
+                    title = if (showTitle) dataValue.dataElementName + if (isMandatoryByRule) " *" else "" else "",
                     state = when {
                         !effectiveEnabled -> InputShellState.DISABLED
                         dataValue.validationState == ValidationState.ERROR || error != null -> InputShellState.ERROR
@@ -349,13 +438,15 @@ fun DataElementAccordion(
     header: String,
     hasData: Boolean,
     expanded: Boolean,
+    elementKey: String,
+    focusedElementKey: String?,
     onToggleExpand: () -> Unit,
     content: @Composable () -> Unit
 ) {
     val bringIntoViewRequester = remember { BringIntoViewRequester() }
     val coroutineScope = rememberCoroutineScope()
-    LaunchedEffect(expanded) {
-        if (expanded) {
+    LaunchedEffect(expanded, focusedElementKey) {
+        if (expanded || focusedElementKey == elementKey) {
             coroutineScope.launch {
                 bringIntoViewRequester.bringIntoView()
             }
@@ -544,10 +635,7 @@ fun CategoryAccordionRecursive(
     expandedAccordions: Map<List<String>, String?>,
     onToggle: (List<String>, String) -> Unit,
 ) {
-    if (categories.size == 1 &&
-        categories.first().second.size == 1 &&
-        categories.first().second.first().second.equals("default", ignoreCase = true)
-    ) {
+    if (categories.size == 1 && categories.first().second.size == 1) {
         values.forEach { dataValue ->
             DataElementRow(
                 dataElementName = dataValue.dataElementName,
@@ -614,7 +702,8 @@ fun CategoryAccordionRecursive(
                             DataValueField(
                                 dataValue = dataValue,
                                 onValueChange = { value -> onValueChange(value, dataValue) },
-                                viewModel = viewModel
+                                viewModel = viewModel,
+                                showTitle = false
                             )
                         }
                     }
@@ -644,7 +733,8 @@ fun CategoryAccordionRecursive(
                             DataValueField(
                                 dataValue = dataValue,
                                 onValueChange = { value -> onValueChange(value, dataValue) },
-                                viewModel = viewModel
+                                viewModel = viewModel,
+                                showTitle = false
                             )
                         }
                     }
@@ -695,7 +785,8 @@ fun EditEntryScreen(
     datasetName: String,
     period: String,
     orgUnit: String,
-    attributeOptionCombo: String
+    attributeOptionCombo: String,
+    isNewEntry: Boolean = false
 ) {
     val state by viewModel.state.collectAsState()
     var lastLoadedParams by remember { mutableStateOf(Quadruple("", "", "", "")) }
@@ -834,6 +925,7 @@ fun EditEntryScreen(
 
     // --- Accordion expansion state for nested accordions ---
     val expandedAccordions = remember { mutableStateOf<Map<List<String>, String?>>(emptyMap()) }
+    var focusedElementKey by remember { mutableStateOf<String?>(null) }
 
     // In EditEntryScreen, define the toggle handler ONCE:
     val onAccordionToggle: (List<String>, String) -> Unit = { parentPath, optionUid ->
@@ -854,21 +946,33 @@ fun EditEntryScreen(
     }
 
 
-    LaunchedEffect(currentParams) {
+    LaunchedEffect(currentParams, isNewEntry) {
         if (state.dataValues.isEmpty() || lastLoadedParams != currentParams) {
             isUIReady = false
-            viewModel.loadDataValues(
-                datasetId = datasetId,
-                datasetName = datasetName,
-                period = period,
-                orgUnitId = orgUnit,
-                attributeOptionCombo = attributeOptionCombo,
-                isEditMode = true
-            )
+            if (isNewEntry) {
+                // New entry: use metadata-only approach (fast, no data value loading)
+                viewModel.loadNewEntry(
+                    datasetId = datasetId,
+                    datasetName = datasetName,
+                    period = period,
+                    orgUnitId = orgUnit,
+                    attributeOptionCombo = attributeOptionCombo
+                )
+            } else {
+                // Existing entry: load actual data values
+                viewModel.loadDataValues(
+                    datasetId = datasetId,
+                    datasetName = datasetName,
+                    period = period,
+                    orgUnitId = orgUnit,
+                    attributeOptionCombo = attributeOptionCombo,
+                    isEditMode = true
+                )
+            }
             lastLoadedParams = currentParams
         }
     }
-    
+
     LaunchedEffect(state.isLoading) {
         if (!state.isLoading) {
             delay(300)
@@ -876,6 +980,7 @@ fun EditEntryScreen(
         }
     }
     fun manualRefresh() {
+        // Manual refresh always loads fresh data (existing entry behavior)
         viewModel.loadDataValues(
             datasetId = datasetId,
             datasetName = datasetName,
@@ -1055,6 +1160,7 @@ fun EditEntryScreen(
                 val targetElementId = group.members.firstOrNull()?.dataElement ?: return@focusSubsection
                 val elementKey = "element_$targetElementId"
                 expandedAccordions.value = mapOf(emptyList<String>() to elementKey)
+                focusedElementKey = elementKey
             }
             var initializedSectionIndex by remember(currentParams) { mutableStateOf<Int?>(null) }
             LaunchedEffect(state.currentSectionIndex, currentParams, state.dataElementGroupedSections.isNotEmpty()) {
@@ -1067,6 +1173,7 @@ fun EditEntryScreen(
                     expandedAccordions.value[emptyList()] == null
                 if (shouldReset && expandedAccordions.value[emptyList()] != elementKey) {
                     expandedAccordions.value = mapOf(emptyList<String>() to elementKey)
+                    focusedElementKey = elementKey
                 }
                 initializedSectionIndex = state.currentSectionIndex
             }
@@ -1158,6 +1265,8 @@ fun EditEntryScreen(
                             subsectionIndex = nextIndex
                             focusSubsection(nextIndex)
                         },
+                        canPreviousSubsection = subsectionTitles.isNotEmpty() && subsectionIndex > 0,
+                        canNextSubsection = subsectionTitles.isNotEmpty() && subsectionIndex < subsectionTitles.lastIndex,
                         hasSubsections = subsectionTitles.isNotEmpty()
                     )
 
@@ -1201,8 +1310,8 @@ fun EditEntryScreen(
                                         // Check if ALL data elements in this section have default category combinations
                                         val allElementsHaveDefaultCategories = elementGroups.values.all { dataValues ->
                                             dataValues.all { dataValue ->
-                                                val structure = state.categoryComboStructures[dataValue.categoryOptionCombo] ?: emptyList()
-                                                structure.isEmpty() || (structure.size == 1 && structure[0].first.lowercase().contains("default"))
+                                                val structure = state.categoryComboStructures[dataValue.categoryOptionCombo].orEmpty()
+                                                structure.isEmpty() || structure.all { (_, options) -> options.size <= 1 }
                                             }
                                         }
 
@@ -1372,7 +1481,9 @@ fun EditEntryScreen(
                                                                 if (targetIndex >= 0) {
                                                                     subsectionIndex = targetIndex
                                                                 }
-                                                            }
+                                                                focusedElementKey = "element_$dataElementId"
+                                                            },
+                                                            focusedElementKey = focusedElementKey
                                                         )
                                                     }
                                                 }
