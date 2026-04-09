@@ -21,7 +21,7 @@ import com.ash.simpledataentry.data.local.OrganisationUnitDao
 import com.ash.simpledataentry.util.NetworkUtils
 import com.ash.simpledataentry.data.local.DataValueEntity
 import com.ash.simpledataentry.data.local.DataValueDao
-import com.ash.simpledataentry.presentation.datasets.DatasetsState.Success
+import com.ash.simpledataentry.presentation.datasets.DatasetsUiState
 import com.ash.simpledataentry.data.cache.MetadataCacheService
 import com.ash.simpledataentry.data.sync.NetworkStateManager
 import com.ash.simpledataentry.data.sync.SyncQueueManager

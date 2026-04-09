@@ -13,6 +13,7 @@ import com.ash.simpledataentry.domain.useCase.DataEntryUseCases
 import com.ash.simpledataentry.util.NetworkUtils
 import com.ash.simpledataentry.data.sync.SyncQueueManager
 import com.ash.simpledataentry.data.sync.SyncState
+import com.ash.simpledataentry.data.sync.SyncService
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -20,6 +21,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import androidx.compose.runtime.mutableStateMapOf
 import javax.inject.Inject
 
 data class DataEntryUiState(
@@ -69,12 +71,13 @@ class DataEntryViewModel @Inject constructor(
     private val useCases: DataEntryUseCases,
     private val draftDao: DataValueDraftDao,
     private val validationRepository: ValidationRepository,
-    private val syncQueueManager: SyncQueueManager
+    private val syncQueueManager: SyncQueueManager,
+    private val syncService: SyncService
 ) : ViewModel() {
     private val _uiState = MutableStateFlow(DataEntryUiState())
 
     val combinedState: StateFlow<CombinedDataEntryState> = _uiState
-        .combine(syncQueueManager.syncState) { ui, sync ->
+        .combine(syncService.legacySyncState) { ui, sync ->
             CombinedDataEntryState(ui, sync)
         }.stateIn(
             scope = viewModelScope,
@@ -344,29 +347,41 @@ class DataEntryViewModel @Inject constructor(
                 return@launch
             }
 
-            val result = syncQueueManager.startSyncForInstance(
-                datasetId = stateSnapshot.datasetId,
-                period = stateSnapshot.period,
-                orgUnit = stateSnapshot.orgUnit,
-                attributeOptionCombo = stateSnapshot.attributeOptionCombo,
-                forceSync = true
-            )
+            try {
+                Log.d("DataEntryViewModel", "Starting enhanced sync for dataset: ${stateSnapshot.datasetId}")
 
-            if (result.isSuccess) {
-                Log.d("DataEntryViewModel", "Sync for instance completed successfully.")
-                _uiState.update { it.copy(successMessage = "Data synced successfully!") }
-                loadDataValues(
-                    datasetId = stateSnapshot.datasetId,
-                    datasetName = stateSnapshot.datasetName,
-                    period = stateSnapshot.period,
-                    orgUnitId = stateSnapshot.orgUnit,
-                    attributeOptionCombo = stateSnapshot.attributeOptionCombo,
-                    isEditMode = stateSnapshot.isEditMode
+                // Use enhanced sync service with conflict detection and transactional safety
+                val result = syncService.startEnhancedSync(
+                    forceSync = true,
+                    autoResolveConflicts = true // Auto-resolve conflicts for now, can be made configurable
                 )
-            } else {
-                val errorMessage = result.exceptionOrNull()?.message ?: "Unknown error during sync."
-                Log.e("DataEntryViewModel", "Sync for instance failed: $errorMessage")
-                _uiState.update { it.copy(error = "Sync failed: $errorMessage") }
+
+                if (result.success) {
+                    Log.d("DataEntryViewModel", "Enhanced sync completed successfully. Synced: ${result.syncedItems}, Skipped: ${result.skippedItems}")
+                    val successMessage = if (result.conflictsResolved > 0) {
+                        "Data synced successfully! Resolved ${result.conflictsResolved} conflicts."
+                    } else {
+                        "Data synced successfully!"
+                    }
+                    _uiState.update { it.copy(successMessage = successMessage) }
+
+                    // Reload data to reflect server changes
+                    loadDataValues(
+                        datasetId = stateSnapshot.datasetId,
+                        datasetName = stateSnapshot.datasetName,
+                        period = stateSnapshot.period,
+                        orgUnitId = stateSnapshot.orgUnit,
+                        attributeOptionCombo = stateSnapshot.attributeOptionCombo,
+                        isEditMode = stateSnapshot.isEditMode
+                    )
+                } else {
+                    val errorMessage = result.error ?: "Unknown error during enhanced sync."
+                    Log.e("DataEntryViewModel", "Enhanced sync failed: $errorMessage")
+                    _uiState.update { it.copy(error = "Sync failed: $errorMessage") }
+                }
+            } catch (e: Exception) {
+                Log.e("DataEntryViewModel", "Exception during enhanced sync: ${e.message}", e)
+                _uiState.update { it.copy(error = "Sync failed: ${e.message}") }
             }
         }
     }

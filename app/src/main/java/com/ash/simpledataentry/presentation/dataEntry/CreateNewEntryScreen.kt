@@ -56,7 +56,8 @@ fun CreateNewEntryScreen(
     var attributeOptionCombos by remember { mutableStateOf<List<Pair<String, String>>>(emptyList()) }
     var selectedAttributeOptionCombo by remember { mutableStateOf("") }
     var expandedAttributeOptionCombo by remember { mutableStateOf(false) }
-    val state by viewModel.state.collectAsState()
+    val combinedState by viewModel.combinedState.collectAsState()
+    val state = combinedState.uiState
 
     LaunchedEffect(datasetId) {
         try {

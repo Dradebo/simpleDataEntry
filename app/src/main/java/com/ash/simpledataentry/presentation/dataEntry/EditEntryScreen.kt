@@ -184,7 +184,7 @@ fun EditEntryScreen(
             ),
             onConfirm = { uploadFirst ->
                 Log.d("EditEntryScreen", "SyncConfirmationDialog onConfirm called with uploadFirst: $uploadFirst")
-                viewModel.syncDataEntry(uploadFirst)
+                viewModel.syncData()
                 showSyncDialog.value = false
                 Log.d("EditEntryScreen", "showSyncDialog set to false after confirm")
             },
@@ -784,7 +784,8 @@ private fun SectionContent(
         "SectionContent",
         "sectionName=$sectionName, structure=${structure?.map { it.first }}, values=${values.map { it.dataElement + ":" + it.categoryOptionCombo }}"
     )
-    val state by viewModel.state.collectAsState()
+    val combinedState by viewModel.combinedState.collectAsState()
+    val state = combinedState.uiState
     val categoryComboStructures = state.categoryComboStructures
     val dataElements = values.map { it.dataElement to it.dataElementName }.distinct()
 
@@ -1634,7 +1635,7 @@ private fun renderCategoryComboGroup(
                             )
                             colCat.second.forEach { (colUid, _) ->
                                 val dataValuesForCell = values.filter { dv ->
-                                    val comboStructure = viewModel.state.value.categoryComboStructures[dv.categoryOptionCombo]
+                                    val comboStructure = viewModel.combinedState.value.uiState.categoryComboStructures[dv.categoryOptionCombo]
                                     comboStructure?.any { cat ->
                                         cat.first == rowCat.first && cat.second.any { it.first == rowUid }
                                     } == true &&
@@ -1690,7 +1691,7 @@ private fun renderCategoryComboGroup(
                                     modifier = Modifier.padding(bottom = 2.dp)
                                 )
                                 values.filter { dv ->
-                                    val comboStructure = viewModel.state.value.categoryComboStructures[dv.categoryOptionCombo]
+                                    val comboStructure = viewModel.combinedState.value.uiState.categoryComboStructures[dv.categoryOptionCombo]
                                     comboStructure?.any { cat ->
                                         cat.first == rowCat.first && cat.second.any { it.first == headerUid }
                                     } == true &&
@@ -1724,7 +1725,7 @@ private fun renderCategoryComboGroup(
         else -> {
             // Fallback: render each element by its own combo (Rule 5)
             values.forEach { dataValue ->
-                val elementStructure = viewModel.state.value.categoryComboStructures[dataValue.categoryOptionCombo] ?: emptyList()
+                val elementStructure = viewModel.combinedState.value.uiState.categoryComboStructures[dataValue.categoryOptionCombo] ?: emptyList()
                 if (elementStructure.isEmpty()) {
                     DataElementRow(
                         dataElementName = dataValue.dataElementName,
@@ -2029,7 +2030,7 @@ fun CategoryAccordionRecursiveWithFields(
                 val filteredValues = values.filter { dataValue ->
                     // Use the same exact matching approach as final level for consistency
                     // This ensures the filtering is mathematically correct for any number of categories
-                    val comboStructure = viewModel.state.value.categoryComboStructures[dataValue.categoryOptionCombo]
+                    val comboStructure = viewModel.combinedState.value.uiState.categoryComboStructures[dataValue.categoryOptionCombo]
                     val comboOptions = comboStructure?.flatMap { it.second.map { option -> option.first } }?.toSet() ?: emptySet()
                     
                     // For intermediate levels: keep combinations that contain ALL our selected options

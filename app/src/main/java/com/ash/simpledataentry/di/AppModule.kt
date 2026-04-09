@@ -52,10 +52,17 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 import com.ash.simpledataentry.data.local.DataValueDao
 import com.ash.simpledataentry.data.cache.MetadataCacheService
+import com.ash.simpledataentry.data.sync.AdaptiveSyncStrategy
 import com.ash.simpledataentry.data.sync.BackgroundDataPrefetcher
 import com.ash.simpledataentry.data.sync.NetworkStateManager
 import com.ash.simpledataentry.data.sync.SyncQueueManager
 import com.ash.simpledataentry.data.sync.BackgroundSyncManager
+import com.ash.simpledataentry.data.sync.ConflictDetectionService
+import com.ash.simpledataentry.data.sync.TransactionalSyncManager
+import com.ash.simpledataentry.data.sync.EnhancedSyncOrchestrator
+import com.ash.simpledataentry.data.sync.SyncService
+import com.ash.simpledataentry.data.sync.ComprehensiveSyncOrchestrator
+import com.ash.simpledataentry.data.session.EnhancedSessionManager
 
 @Module
 @InstallIn(SingletonComponent::class)
@@ -234,12 +241,99 @@ object AppModule {
 
     @Provides
     @Singleton
+    fun provideAdaptiveSyncStrategy(): AdaptiveSyncStrategy {
+        return AdaptiveSyncStrategy()
+    }
+
+    @Provides
+    @Singleton
     fun provideSyncQueueManager(
         networkStateManager: NetworkStateManager,
         sessionManager: SessionManager,
-        database: AppDatabase
+        database: AppDatabase,
+        adaptiveSyncStrategy: AdaptiveSyncStrategy
     ): SyncQueueManager {
-        return SyncQueueManager(networkStateManager, sessionManager, database)
+        return SyncQueueManager(networkStateManager, sessionManager, database, adaptiveSyncStrategy)
+    }
+
+    @Provides
+    @Singleton
+    fun provideConflictDetectionService(
+        sessionManager: SessionManager,
+        database: AppDatabase
+    ): ConflictDetectionService {
+        return ConflictDetectionService(sessionManager, database)
+    }
+
+    @Provides
+    @Singleton
+    fun provideTransactionalSyncManager(
+        sessionManager: SessionManager,
+        database: AppDatabase,
+        adaptiveSyncStrategy: AdaptiveSyncStrategy,
+        networkStateManager: NetworkStateManager
+    ): TransactionalSyncManager {
+        return TransactionalSyncManager(sessionManager, database, adaptiveSyncStrategy, networkStateManager)
+    }
+
+    @Provides
+    @Singleton
+    fun provideEnhancedSyncOrchestrator(
+        networkStateManager: NetworkStateManager,
+        sessionManager: SessionManager,
+        database: AppDatabase,
+        conflictDetectionService: ConflictDetectionService,
+        transactionalSyncManager: TransactionalSyncManager,
+        adaptiveSyncStrategy: AdaptiveSyncStrategy
+    ): EnhancedSyncOrchestrator {
+        return EnhancedSyncOrchestrator(
+            networkStateManager,
+            sessionManager,
+            database,
+            conflictDetectionService,
+            transactionalSyncManager,
+            adaptiveSyncStrategy
+        )
+    }
+
+    @Provides
+    @Singleton
+    fun provideSyncService(
+        enhancedSyncOrchestrator: EnhancedSyncOrchestrator,
+        syncQueueManager: SyncQueueManager
+    ): SyncService {
+        return SyncService(enhancedSyncOrchestrator, syncQueueManager)
+    }
+
+    @Provides
+    @Singleton
+    fun provideEnhancedSessionManager(
+        baseSessionManager: SessionManager,
+        accountEncryption: AccountEncryption
+    ): EnhancedSessionManager {
+        return EnhancedSessionManager(baseSessionManager, accountEncryption)
+    }
+
+    @Provides
+    @Singleton
+    fun provideComprehensiveSyncOrchestrator(
+        sessionManager: SessionManager,
+        enhancedSessionManager: EnhancedSessionManager,
+        networkStateManager: NetworkStateManager,
+        datasetsRepository: DatasetsRepository,
+        datasetInstancesRepository: DatasetInstancesRepository,
+        enhancedSyncOrchestrator: EnhancedSyncOrchestrator,
+        database: AppDatabase
+    ): ComprehensiveSyncOrchestrator {
+        return ComprehensiveSyncOrchestrator(
+            sessionManager,
+            enhancedSessionManager,
+            networkStateManager,
+            datasetsRepository,
+            datasetInstancesRepository,
+            enhancedSyncOrchestrator,
+            database
+        )
     }
 
     @Provides

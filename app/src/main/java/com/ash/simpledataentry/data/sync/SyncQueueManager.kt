@@ -27,7 +27,8 @@ data class SyncState(
 class SyncQueueManager @Inject constructor(
     private val networkStateManager: NetworkStateManager,
     private val sessionManager: SessionManager,
-    private val database: AppDatabase
+    private val database: AppDatabase,
+    private val adaptiveSyncStrategy: AdaptiveSyncStrategy
 ) {
     
     private val tag = "SyncQueueManager"
@@ -39,29 +40,33 @@ class SyncQueueManager @Inject constructor(
     private var syncJob: Job? = null
     private var networkMonitorJob: Job? = null
     
-    // Timeout configuration - optimized for upload vs download operations
-    private val uploadTimeoutMs = 180000L // 3 minutes for uploads (server processing intensive)
-    private val downloadTimeoutMs = 60000L // 1 minute for downloads (typically faster)
-    private val connectionTimeoutMs = 30000L // 30 seconds for connection establishment
+    // Dynamic configuration based on network quality
+    private fun getCurrentSyncTimeouts(): SyncTimeouts {
+        val networkQuality = networkStateManager.networkState.value.connectionQuality
+        return adaptiveSyncStrategy.calculateTimeouts(networkQuality)
+    }
 
-    // Retry configuration with progressive backoff
-    private val maxRetryAttempts = 3 // Reduced attempts but longer timeouts
-    private val baseRetryDelayMs = 5000L // Start with 5 seconds
-    private val maxRetryDelayMs = 120000L // Up to 2 minutes between retries
+    private fun getCurrentChunkSize(): Int {
+        val networkQuality = networkStateManager.networkState.value.connectionQuality
+        return adaptiveSyncStrategy.calculateOptimalChunkSize(networkQuality)
+    }
 
-    // Chunk configuration for large data uploads - adaptive sizing based on network conditions
-    private val baseChunkSize = 25 // Base chunk size for stable networks
-    private val maxChunkSize = 50 // Maximum data values per upload chunk
-    private val minChunkSize = 10 // Minimum chunk size for poor networks
+    private fun getMaxRetryAttempts(): Int {
+        val networkQuality = networkStateManager.networkState.value.connectionQuality
+        return adaptiveSyncStrategy.getMaxRetryAttempts(networkQuality)
+    }
     
     suspend fun queueForSync() {
         val currentQueueSize = database.dataValueDraftDao().getAllDrafts().size
         _syncState.value = _syncState.value.copy(queueSize = currentQueueSize)
         
-        if (networkStateManager.isOnline() && !_syncState.value.isRunning) {
+        val networkState = networkStateManager.networkState.value
+        val qualityAdequate = adaptiveSyncStrategy.isQualityAdequateForSync(networkState.connectionQuality)
+
+        if (networkStateManager.isOnline() && !_syncState.value.isRunning && qualityAdequate) {
             startSync()
         } else {
-            Log.d(tag, "Queued for sync - Network available: ${networkStateManager.isOnline()}, Sync running: ${_syncState.value.isRunning}")
+            Log.d(tag, "Queued for sync - Network available: ${networkStateManager.isOnline()}, Quality adequate: $qualityAdequate, Sync running: ${_syncState.value.isRunning}")
         }
     }
     
@@ -183,10 +188,13 @@ class SyncQueueManager @Inject constructor(
 
             Log.d(tag, "Successfully set ${allSuccessfulDrafts.size} values, starting upload")
 
-            // Step 2: Upload ALL set values ONCE with retry logic
+            // Step 2: Upload ALL set values ONCE with adaptive retry logic
             var lastException: Exception? = null
             var attempt = 0
             var uploadSuccessful = false
+            val networkQuality = networkStateManager.networkState.value.connectionQuality
+            val maxRetryAttempts = getMaxRetryAttempts()
+            val syncTimeouts = getCurrentSyncTimeouts()
 
             _syncState.value = _syncState.value.copy(progress = 40, step = "Uploading data to server...")
 
@@ -194,8 +202,8 @@ class SyncQueueManager @Inject constructor(
                 try {
                     Log.d(tag, "Upload attempt ${attempt + 1} of $maxRetryAttempts for ${allSuccessfulDrafts.size} values")
 
-                    // Use withTimeout to handle long-running upload operations
-                    val uploadResult = withTimeout(uploadTimeoutMs) {
+                    // Use adaptive timeout to handle long-running upload operations
+                    val uploadResult = withTimeout(syncTimeouts.uploadTimeoutMs) {
                         d2.dataValueModule().dataValues().blockingUpload()
                     }
                     Log.d(tag, "Upload result: $uploadResult")
@@ -218,18 +226,21 @@ class SyncQueueManager @Inject constructor(
                     val errorMessage = extractErrorMessage(e)
                     Log.w(tag, "Upload attempt $attempt failed: $errorMessage", e)
 
-                    // Check if we should retry based on error type
-                    val shouldRetry = shouldRetryForError(e) && attempt < maxRetryAttempts
+                    // Check if we should retry based on error type and network quality
+                    val shouldRetry = adaptiveSyncStrategy.shouldRetryImmediately(
+                        networkQuality, e, attempt, maxRetryAttempts
+                    )
 
                     if (shouldRetry) {
-                        // Calculate progressive backoff delay - longer for network issues
-                        val baseDelay = if (isNetworkTimeoutError(e)) baseRetryDelayMs * 2 else baseRetryDelayMs
-                        val delay = minOf(
-                            baseDelay * (1L shl (attempt - 1)),
-                            maxRetryDelayMs
+                        // Calculate adaptive backoff delay
+                        val delay = adaptiveSyncStrategy.calculateBackoffDelay(
+                            networkQuality,
+                            attempt,
+                            syncTimeouts.retryDelayMs,
+                            syncTimeouts.maxRetryDelayMs
                         )
 
-                        Log.w(tag, "Retrying upload in ${delay}ms (attempt ${attempt + 1} of $maxRetryAttempts)")
+                        Log.w(tag, "Retrying upload in ${delay}ms (attempt ${attempt + 1} of $maxRetryAttempts) - Quality: $networkQuality")
                         delay(delay)
 
                         // Check if network is still available before retry
@@ -253,7 +264,7 @@ class SyncQueueManager @Inject constructor(
             // Download latest data to sync (with timeout) - only if some uploads succeeded
             if (allSuccessfulDrafts.isNotEmpty()) {
                 try {
-                    withTimeout(downloadTimeoutMs) {
+                    withTimeout(syncTimeouts.downloadTimeoutMs) {
                         d2.dataValueModule().dataValues().get()
                     }
                 } catch (e: Exception) {
@@ -365,10 +376,13 @@ class SyncQueueManager @Inject constructor(
 
             Log.d(tag, "Successfully set ${allSuccessfulDrafts.size} values for instance, starting upload")
 
-            // Step 2: Upload ALL set values ONCE with retry logic
+            // Step 2: Upload ALL set values ONCE with adaptive retry logic
             var lastException: Exception? = null
             var attempt = 0
             var uploadSuccessful = false
+            val networkQuality = networkStateManager.networkState.value.connectionQuality
+            val maxRetryAttempts = getMaxRetryAttempts()
+            val syncTimeouts = getCurrentSyncTimeouts()
 
             _syncState.value = _syncState.value.copy(progress = 40, step = "Uploading data to server...")
 
@@ -376,8 +390,8 @@ class SyncQueueManager @Inject constructor(
                 try {
                     Log.d(tag, "Upload attempt ${attempt + 1} of $maxRetryAttempts for ${allSuccessfulDrafts.size} values from instance")
 
-                    // Use withTimeout to handle long-running upload operations
-                    val uploadResult = withTimeout(uploadTimeoutMs) {
+                    // Use adaptive timeout to handle long-running upload operations
+                    val uploadResult = withTimeout(syncTimeouts.uploadTimeoutMs) {
                         d2.dataValueModule().dataValues().blockingUpload()
                     }
                     Log.d(tag, "Upload result for instance: $uploadResult")
@@ -400,18 +414,21 @@ class SyncQueueManager @Inject constructor(
                     val errorMessage = extractErrorMessage(e)
                     Log.w(tag, "Upload attempt $attempt failed for instance: $errorMessage", e)
 
-                    // Check if we should retry based on error type
-                    val shouldRetry = shouldRetryForError(e) && attempt < maxRetryAttempts
+                    // Check if we should retry based on error type and network quality
+                    val shouldRetry = adaptiveSyncStrategy.shouldRetryImmediately(
+                        networkQuality, e, attempt, maxRetryAttempts
+                    )
 
                     if (shouldRetry) {
-                        // Calculate progressive backoff delay - longer for network issues
-                        val baseDelay = if (isNetworkTimeoutError(e)) baseRetryDelayMs * 2 else baseRetryDelayMs
-                        val delay = minOf(
-                            baseDelay * (1L shl (attempt - 1)),
-                            maxRetryDelayMs
+                        // Calculate adaptive backoff delay
+                        val delay = adaptiveSyncStrategy.calculateBackoffDelay(
+                            networkQuality,
+                            attempt,
+                            syncTimeouts.retryDelayMs,
+                            syncTimeouts.maxRetryDelayMs
                         )
 
-                        Log.w(tag, "Retrying upload for instance in ${delay}ms (attempt ${attempt + 1} of $maxRetryAttempts)")
+                        Log.w(tag, "Retrying upload for instance in ${delay}ms (attempt ${attempt + 1} of $maxRetryAttempts) - Quality: $networkQuality")
                         delay(delay)
 
                         // Check if network is still available before retry
@@ -435,7 +452,7 @@ class SyncQueueManager @Inject constructor(
             // Download latest data to sync (with timeout) - only if some uploads succeeded
             if (allSuccessfulDrafts.isNotEmpty()) {
                 try {
-                    withTimeout(downloadTimeoutMs) {
+                    withTimeout(syncTimeouts.downloadTimeoutMs) {
                         d2.dataValueModule().dataValues().get()
                     }
                 } catch (e: Exception) {
@@ -496,11 +513,13 @@ class SyncQueueManager @Inject constructor(
      */
     private fun getAdaptiveChunkSize(): Int {
         val currentFailures = _syncState.value.failedAttempts
+        val baseChunkSize = getCurrentChunkSize()
+
         return when {
             // If we've had multiple failures, use smaller chunks
-            currentFailures >= 3 -> minChunkSize
-            currentFailures >= 1 -> baseChunkSize / 2
-            // If sync has been successful recently, use larger chunks
+            currentFailures >= 3 -> maxOf(baseChunkSize / 4, 5)
+            currentFailures >= 1 -> maxOf(baseChunkSize / 2, 5)
+            // If sync has been successful recently, use base chunks
             else -> baseChunkSize
         }
     }

@@ -33,7 +33,7 @@ class BackgroundSyncWorker @AssistedInject constructor(
     private val datasetsRepository: DatasetsRepository,
     private val datasetInstancesRepository: DatasetInstancesRepository,
     private val networkStateManager: NetworkStateManager,
-    private val syncQueueManager: SyncQueueManager
+    private val enhancedSyncOrchestrator: EnhancedSyncOrchestrator
 ) : CoroutineWorker(context, workerParams) {
 
     companion object {
@@ -69,20 +69,24 @@ class BackgroundSyncWorker @AssistedInject constructor(
             updateProgress("Syncing instances...", 30)
             datasetInstancesRepository.syncDatasetInstances() // Assuming this doesn't return a result to check
 
-            // Step 2: Upload pending data
+            // Step 2: Upload pending data using enhanced orchestrator
             updateProgress("Uploading local data...", 60)
-            val uploadResult = syncQueueManager.startSync(forceSync = true)
+            val syncResult = enhancedSyncOrchestrator.startFullSync(
+                forceSync = true,
+                autoResolveConflicts = true // Use auto-resolution for background sync
+            )
 
-            return if (uploadResult.isSuccess) {
+            val result = if (syncResult.success) {
                 updateProgress("Sync completed", 100)
-                Log.d(TAG, "Background sync completed successfully.")
+                Log.d(TAG, "Background sync completed successfully. Synced: ${syncResult.syncedItems}, Skipped: ${syncResult.skippedItems}")
                 Result.success()
             } else {
-                val error = uploadResult.exceptionOrNull()?.message ?: "Unknown upload error"
+                val error = syncResult.error ?: "Unknown upload error"
                 Log.e(TAG, "Background sync failed during data upload: $error")
                 updateProgress("Sync failed", 0, error)
                 Result.failure(workDataOf("error" to error))
             }
+            result
 
         } catch (e: Exception) {
             Log.e(TAG, "Background sync failed with exception: ${e.message}", e)

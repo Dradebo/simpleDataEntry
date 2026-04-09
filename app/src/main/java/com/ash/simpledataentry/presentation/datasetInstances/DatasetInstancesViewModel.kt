@@ -19,6 +19,7 @@ import com.ash.simpledataentry.util.PeriodHelper
 import com.ash.simpledataentry.data.local.DataValueDraftDao
 import com.ash.simpledataentry.data.sync.SyncQueueManager
 import com.ash.simpledataentry.data.sync.SyncState
+import com.ash.simpledataentry.data.sync.SyncService
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -49,6 +50,7 @@ class DatasetInstancesViewModel @Inject constructor(
     private val datasetsRepository: com.ash.simpledataentry.domain.repository.DatasetsRepository,
     private val draftDao: DataValueDraftDao,
     private val syncQueueManager: SyncQueueManager,
+    private val syncService: SyncService,
     private val app: Application
 ) : ViewModel() {
     private var datasetId: String = ""
@@ -56,7 +58,7 @@ class DatasetInstancesViewModel @Inject constructor(
     private val _uiState = MutableStateFlow(DatasetInstancesUiState())
 
     val combinedState: StateFlow<CombinedDatasetInstancesState> = _uiState
-        .combine(syncQueueManager.syncState) { ui, sync ->
+        .combine(syncService.legacySyncState) { ui, sync ->
             CombinedDatasetInstancesState(ui, sync)
         }.stateIn(
             scope = viewModelScope,
@@ -169,7 +171,31 @@ class DatasetInstancesViewModel @Inject constructor(
 
     fun syncDatasetInstances() {
         viewModelScope.launch {
-            syncQueueManager.startSync()
+            try {
+                Log.d("DatasetInstancesViewModel", "Starting enhanced sync for dataset instances")
+                val result = syncService.startEnhancedSync(
+                    forceSync = true,
+                    autoResolveConflicts = true
+                )
+
+                if (result.success) {
+                    Log.d("DatasetInstancesViewModel", "Enhanced sync completed successfully. Synced: ${result.syncedItems}")
+                    _uiState.update { it.copy(
+                        successMessage = "Dataset instances synced successfully!"
+                    )}
+                    loadData() // Refresh data after sync
+                } else {
+                    Log.e("DatasetInstancesViewModel", "Enhanced sync failed: ${result.error}")
+                    _uiState.update { it.copy(
+                        error = "Sync failed: ${result.error}"
+                    )}
+                }
+            } catch (e: Exception) {
+                Log.e("DatasetInstancesViewModel", "Exception during enhanced sync: ${e.message}", e)
+                _uiState.update { it.copy(
+                    error = "Sync failed: ${e.message}"
+                )}
+            }
         }
     }
 

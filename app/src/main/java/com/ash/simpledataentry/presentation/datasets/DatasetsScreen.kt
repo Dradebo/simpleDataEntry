@@ -271,7 +271,7 @@ fun DatasetsScreen(
 
                     // Main content
                     when (datasetsState) {
-                        is DatasetsState.Loading -> {
+                        is DatasetsUiState.Loading -> {
                             Box(
                                 modifier = Modifier.fillMaxSize(),
                                 contentAlignment = Alignment.Center
@@ -280,31 +280,25 @@ fun DatasetsScreen(
                             }
                         }
 
-                        is DatasetsState.Error -> {
+                        is DatasetsUiState.Error -> {
                             LaunchedEffect(datasetsState) {
-                                snackbarHostState.showSnackbar((datasetsState as DatasetsState.Error).message)
+                                snackbarHostState.showSnackbar((datasetsState as DatasetsUiState.Error).message)
                             }
                             Box(
                                 modifier = Modifier.fillMaxSize(),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Text(
-                                    text = (datasetsState as DatasetsState.Error).message,
+                                    text = (datasetsState as DatasetsUiState.Error).message,
                                     color = MaterialTheme.colorScheme.error,
                                     textAlign = TextAlign.Center
                                 )
                             }
                         }
 
-                        is DatasetsState.Success -> {
-                            val successState = datasetsState as DatasetsState.Success
-                            // Show sync success message
-                            LaunchedEffect(successState.syncMessage) {
-                                successState.syncMessage?.let { message ->
-                                    snackbarHostState.showSnackbar(message)
-                                    viewModel.clearSyncMessage()
-                                }
-                            }
+                        is DatasetsUiState.Success -> {
+                            val successState = datasetsState as DatasetsUiState.Success
+                            // Sync state handling is managed through syncState
 
                             val syncItem = AdditionalInfoItem(
                                 key = "",
